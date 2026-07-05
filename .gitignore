@@ -27,6 +27,12 @@ window_*.xml
 /tray_command.json
 /local.properties
 
+# 服务器自己维护的运行环境配置(域名/路径),不进 git,避免覆盖线上配置或泄露 operator token
+deploy/scitoday.env
+
+# frp SSH 私钥绝不入库(历史泄露过,已轮换;这里防再次误提交)
+/frp/ssh/
+
 # Runtime data
 *.db
 *.db-*
