@@ -1,0 +1,38 @@
+# 统一换行符:仓库内一律 LF,防止 Windows 开发机把 CRLF 带到 Linux 服务器。
+# CRLF 会导致:.sh 报 "bad interpreter"、.env 把 RSSAI_RUNTIME=pc 读成 "pc\r"
+# (触发 Termux 路径回退)、systemd/.conf 解析异常、以及满屏 ^M 的假 diff。
+
+# 默认:自动识别文本文件,提交入库时一律规范化为 LF,检出时也保持 LF。
+* text=auto eol=lf
+
+# ---- 在 Linux 上运行或被 source 的文件:强制 LF(最关键)----
+*.sh       text eol=lf
+*.py       text eol=lf
+*.service  text eol=lf
+*.conf     text eol=lf
+*.env      text eol=lf
+*.opml     text eol=lf
+*.json     text eol=lf
+*.js       text eol=lf
+*.css      text eol=lf
+*.html     text eol=lf
+*.md       text eol=lf
+*.txt      text eol=lf
+*.svg      text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+
+# ---- 二进制文件:禁止任何换行/编码转换 ----
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.ico      binary
+*.pdf      binary
+*.zip      binary
+*.whl      binary
+*.exe      binary
+*.db       binary
+*.sqlite   binary
+*.sqlite3  binary
+*.pub      binary
