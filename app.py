@@ -436,6 +436,8 @@ _CONFIG_ALLOWED_FIELDS = {
         }
     ),
 }
+_AI_CONNECTION_FIELDS = frozenset({"api_key", "base_url", "model"})
+_AI_PROMPT_FIELDS = frozenset({"system_prompt", "rss_prompt", "pdf_prompt"})
 # 正整数字段的上界，防止荒谬取值拖垮抓取/调度。
 _CONFIG_INT_LIMITS = {
     "per_feed_limit": (1, 100),
@@ -518,38 +520,50 @@ def api_save_config():
                 "required_scope": "tenant_admin",
             }), 403
         ai_payload = dict(data["ai"])
-        connection_payload = {
+        allowed_ai_payload = {
             key: ai_payload[key]
-            for key in ("api_key", "base_url", "model")
+            for key in _AI_CONNECTION_FIELDS | _AI_PROMPT_FIELDS
             if key in ai_payload
         }
-        if not connection_payload:
+        if not allowed_ai_payload:
             return jsonify({
                 "error": "forbidden",
                 "required_scope": "tenant_admin",
             }), 403
-        incoming, error = _validate_ai_connection_payload(
-            connection_payload,
-            reject_unknown=True,
-        )
-        if error:
-            return jsonify({"error": error}), 400
+        connection_payload = {
+            key: value
+            for key, value in allowed_ai_payload.items()
+            if key in _AI_CONNECTION_FIELDS
+        }
+        incoming = {}
+        if connection_payload:
+            incoming, error = _validate_ai_connection_payload(
+                connection_payload,
+                reject_unknown=True,
+            )
+            if error:
+                return jsonify({"error": error}), 400
+        incoming.update({
+            key: value
+            for key, value in allowed_ai_payload.items()
+            if key in _AI_PROMPT_FIELDS
+        })
         cfg = tasks.load_config()
         if incoming:
             cfg.setdefault("ai", {}).update(incoming)
             tasks.save_config(cfg)
             tasks.record_event(
                 "settings",
-                "AI 连接配置已通过兼容接口更新",
+                "AI 配置已通过兼容接口更新",
                 details={
                     "fields": sorted(incoming),
-                    "ignored_fields": sorted(set(ai_payload) - set(connection_payload)),
+                    "ignored_fields": sorted(set(ai_payload) - set(allowed_ai_payload)),
                 },
             )
         return jsonify({
             "ok": True,
             "compatibility_mode": True,
-            "ignored_fields": sorted(set(ai_payload) - set(connection_payload)),
+            "ignored_fields": sorted(set(ai_payload) - set(allowed_ai_payload)),
         })
 
     cfg = tasks.load_config()
@@ -689,8 +703,7 @@ def _public_ai_connection(config=None):
 
 
 def _validate_ai_connection_payload(data, *, reject_unknown):
-    allowed = {"api_key", "base_url", "model"}
-    unknown = sorted(set(data) - allowed)
+    unknown = sorted(set(data) - _AI_CONNECTION_FIELDS)
     if reject_unknown and unknown:
         return None, f"不允许修改字段: {', '.join(unknown)}"
     if not data:

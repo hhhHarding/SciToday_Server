@@ -189,14 +189,14 @@ class MultiTokenAuthTests(unittest.TestCase):
         )
         self.assertEqual(runtime_response.status_code, 403)
 
-    def test_ai_config_writer_can_only_update_own_connection_fields(self):
+    def test_ai_config_writer_can_only_update_own_ai_fields(self):
         secret = "beta-private-ai-key"
         response = self.client.patch(
             "/api/ai-config",
             headers=self._headers(self.beta_ai_writer.token),
             json={
                 "api_key": secret,
-                "base_url": "https://beta-ai.example/v1/",
+                "base_url": "https://1.1.1.1/v1/",
                 "model": "beta-model",
             },
         )
@@ -212,7 +212,7 @@ class MultiTokenAuthTests(unittest.TestCase):
         with tenant_context("t_alpha"):
             alpha_ai = tasks.load_config().get("ai") or {}
         self.assertEqual(beta_ai["api_key"], secret)
-        self.assertEqual(beta_ai["base_url"], "https://beta-ai.example/v1")
+        self.assertEqual(beta_ai["base_url"], "https://1.1.1.1/v1")
         self.assertEqual(beta_ai["model"], "beta-model")
         self.assertNotEqual(alpha_ai.get("api_key"), secret)
 
@@ -222,11 +222,11 @@ class MultiTokenAuthTests(unittest.TestCase):
             json={
                 "ai": {
                     "api_key": tasks.MASKED_SECRET,
-                    "base_url": "https://legacy-client.example/v1",
+                    "base_url": "https://8.8.8.8/v1",
                     "model": "legacy-model",
-                    "system_prompt": "must-be-ignored",
-                    "rss_prompt": "must-be-ignored",
-                    "pdf_prompt": "must-be-ignored",
+                    "system_prompt": "beta-system-prompt",
+                    "rss_prompt": "beta-rss-prompt",
+                    "pdf_prompt": "beta-pdf-prompt",
                 },
             },
         )
@@ -235,23 +235,30 @@ class MultiTokenAuthTests(unittest.TestCase):
         with tenant_context("t_beta"):
             legacy_ai = tasks.load_config()["ai"]
         self.assertEqual(legacy_ai["model"], "legacy-model")
-        self.assertNotEqual(
-            legacy_ai.get("system_prompt"),
-            "must-be-ignored",
-        )
+        self.assertEqual(legacy_ai["system_prompt"], "beta-system-prompt")
+        self.assertEqual(legacy_ai["rss_prompt"], "beta-rss-prompt")
+        self.assertEqual(legacy_ai["pdf_prompt"], "beta-pdf-prompt")
+        with tenant_context("t_alpha"):
+            alpha_ai = tasks.load_config().get("ai") or {}
+        self.assertNotEqual(alpha_ai.get("system_prompt"), "beta-system-prompt")
 
-        forbidden = self.client.patch(
-            "/api/ai-config",
+        prompts_only = self.client.post(
+            "/api/config",
             headers=self._headers(self.beta_ai_writer.token),
-            json={"system_prompt": "not allowed"},
+            json={"ai": {"system_prompt": "updated-private-prompt"}},
         )
         full_config = self.client.post(
             "/api/config",
             headers=self._headers(self.beta_ai_writer.token),
             json={"rss": {"per_feed_limit": 99}},
         )
-        self.assertEqual(forbidden.status_code, 400)
+        self.assertEqual(prompts_only.status_code, 200)
         self.assertEqual(full_config.status_code, 403)
+        with tenant_context("t_beta"):
+            self.assertEqual(
+                tasks.load_config()["ai"]["system_prompt"],
+                "updated-private-prompt",
+            )
 
     def test_app_only_token_cannot_write_ai_config(self):
         read_response = self.client.get(

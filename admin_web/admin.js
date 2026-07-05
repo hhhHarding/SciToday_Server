@@ -418,7 +418,7 @@ async function renderTenantPanel() {
     </div>
     <div class="scopeChoices">
       <label class="checkRow"><input type="checkbox" class="tenantScope" value="app" checked>app（读取/推送/上传）</label>
-      <label class="checkRow"><input type="checkbox" class="tenantScope" value="ai_config_write">ai_config_write（改 AI 连接）</label>
+      <label class="checkRow"><input type="checkbox" class="tenantScope" value="ai_config_write">ai_config_write（改 AI 连接/提示词）</label>
       <label class="checkRow"><input type="checkbox" class="tenantScope" value="tenant_admin">tenant_admin（清理/改配置）</label>
     </div>
     <div class="label">创建后 Token 仅显示一次；默认仅授予 app 权限。</div>
