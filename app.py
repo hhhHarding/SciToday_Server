@@ -106,9 +106,10 @@ OPERATOR_ENDPOINTS = frozenset(
 # 纯 app scope 的手机 token 只能读、推送、上传、标记偏好，不能抹数据或改配置。
 # 注意：RSS 源的增删/导入（add_feed/delete_feed/import_opml）属于租户管理自己内容的
 # 常规操作，不是破坏性管理，故只需 app scope（与 get_feeds 一致），不在此集合中。
+# 同理：删单张卡片（api_delete_digest）是软删（只从本租户显示列表隐藏、可恢复、不动共享
+# 内容），属常规内容管理，只需 app scope；仅批量清空 api_clear_digests 才留在此集合。
 TENANT_ADMIN_ENDPOINTS = frozenset(
     {
-        "api_delete_digest",
         "api_clear_digests",
         "api_admin_cleanup",
         "api_reset",
@@ -1314,6 +1315,23 @@ def api_delete_digest(filename):
         return jsonify({"error": str(e)}), 400
     except FileNotFoundError:
         return jsonify({"error": "摘要不存在"}), 404
+
+
+@app.route("/api/digests/<filename>/restore", methods=["POST"])
+def api_restore_digest(filename):
+    try:
+        tasks.restore_digest(filename)
+        return jsonify({"ok": True})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except FileNotFoundError:
+        return jsonify({"error": "摘要不存在"}), 404
+
+
+@app.route("/api/digests/deleted", methods=["GET"])
+def api_deleted_digests():
+    limit = request.args.get("limit", type=int)
+    return jsonify({"items": tasks.list_deleted_digests(limit)})
 
 
 @app.route("/api/digests", methods=["DELETE"])

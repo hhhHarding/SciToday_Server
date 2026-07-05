@@ -1276,6 +1276,11 @@ def _migrate_digest_db(con):
         con.execute("ALTER TABLE digests ADD COLUMN interested INTEGER NOT NULL DEFAULT 0")
     if "is_read" not in cols:
         con.execute("ALTER TABLE digests ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0")
+    if "deleted" not in cols:
+        # 每租户软删标志：删卡片只从本租户显示列表隐藏，绝不动共享内容。
+        con.execute("ALTER TABLE digests ADD COLUMN deleted INTEGER NOT NULL DEFAULT 0")
+    if "deleted_ts" not in cols:
+        con.execute("ALTER TABLE digests ADD COLUMN deleted_ts INTEGER NOT NULL DEFAULT 0")
     for name, ddl in (
         ("relevance_score", "REAL"),
         ("novelty_score", "REAL"),
@@ -4422,7 +4427,7 @@ def get_recent_digests(limit=None, source=None, recommendation=None):
         _sync_digest_index()
         con = _digest_db()
         params = []
-        clauses = []
+        clauses = ["deleted=0"]
         if source:
             clauses.append("source=?")
             params.append(source)
@@ -4482,6 +4487,7 @@ def get_recent_digests(limit=None, source=None, recommendation=None):
             digest["disliked"] = False
             digest["interested"] = False
             digest["is_read"] = False
+            digest["deleted"] = False
             digests.append(digest)
             if limit is not None and len(digests) >= limit:
                 break
@@ -4494,7 +4500,7 @@ def get_digest_updates(after=0, limit=50, source=None):
     _sync_digest_index()
     con = _digest_db()
     params = [after]
-    where = "WHERE id>?"
+    where = "WHERE id>? AND deleted=0"
     if source:
         where += " AND source=?"
         params.append(source)
@@ -4640,20 +4646,87 @@ def update_digest_flags(filename, disliked=None, interested=None, is_read=None):
 
 
 def delete_digest(filename):
+    """软删：只把卡片从本租户显示列表隐藏，保留 HTML 文件与共享内容。
+
+    保留 HTML 文件是硬约束——_sync_digest_index() 会删除“文件已不存在”的行，
+    物理删文件会导致软删行在下次对账时被清掉、无法恢复。因此这里只置标志位。
+    可用 restore_digest() 恢复（支撑 App 的 5 秒撤销 / 设置页回收站）。
+    """
     if not filename or "/" in filename or "\\" in filename or ".." in filename:
         raise ValueError("非法文件名")
     path = INBOX_DIR / filename
     if not path.exists() or not path.is_file():
         raise FileNotFoundError("摘要不存在")
-    path.unlink()
+    _sync_digest_index()
+    con = _digest_db()
     try:
-        con = _digest_db()
-        con.execute("DELETE FROM digests WHERE filename=?", (filename,))
+        cur = con.execute(
+            "UPDATE digests SET deleted=1, deleted_ts=? WHERE filename=?",
+            (int(time.time()), filename),
+        )
         con.commit()
+        if cur.rowcount == 0:
+            raise FileNotFoundError("摘要不存在")
+    finally:
         con.close()
-    except Exception:
-        pass
     return True
+
+
+def restore_digest(filename):
+    """撤销软删：把卡片恢复到本租户显示列表。"""
+    if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        raise ValueError("非法文件名")
+    _sync_digest_index()
+    con = _digest_db()
+    try:
+        row = con.execute(
+            "SELECT deleted FROM digests WHERE filename=?", (filename,)
+        ).fetchone()
+        if row is None:
+            raise FileNotFoundError("摘要不存在")
+        con.execute(
+            "UPDATE digests SET deleted=0, deleted_ts=0 WHERE filename=?",
+            (filename,),
+        )
+        con.commit()
+    finally:
+        con.close()
+    return True
+
+
+def list_deleted_digests(limit=None):
+    """列出本租户已软删的卡片（回收站），按删除时间倒序。"""
+    if limit is not None:
+        limit = int(limit)
+        if limit <= 0:
+            limit = None
+    _sync_digest_index()
+    con = _digest_db()
+    try:
+        params = []
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = "LIMIT ?"
+            params.append(limit)
+        rows = con.execute(f"""SELECT filename, timestamp, title, cn_title, keywords,
+            journal, source, preview, deleted_ts
+            FROM digests
+            WHERE deleted=1
+            ORDER BY deleted_ts DESC, id DESC
+            {limit_clause}""", params).fetchall()
+    finally:
+        con.close()
+    return [{
+        "filename": r[0],
+        "timestamp": r[1] or "",
+        "title": r[2] or "",
+        "cn_title": r[3] or "",
+        "keywords": r[4] or "",
+        "journal": r[5] or "",
+        "source": r[6] or "rss",
+        "preview": r[7] or "",
+        "deleted_ts": int(r[8] or 0),
+    } for r in rows]
 
 
 def clear_digests(source=None):
