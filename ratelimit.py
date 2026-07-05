@@ -90,7 +90,7 @@ class RateLimiter:
 # 端点前缀 → 类别的归类规则。按顺序匹配 request.endpoint。
 def category_for_endpoint(endpoint: str | None) -> str:
     name = endpoint or ""
-    if name in ("api_chat",):
+    if name in ("api_chat", "api_test_ai_config"):
         return "ai"
     if name in ("upload_pdf", "upload_pdf_chunk"):
         return "upload"

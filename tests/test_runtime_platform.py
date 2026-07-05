@@ -52,6 +52,22 @@ class RuntimePlatformTests(unittest.TestCase):
                 "config-key",
             )
 
+    def test_ai_base_url_only_adds_v1_when_provider_path_is_empty(self):
+        self.assertEqual(
+            tasks._normalize_ai_base_url("https://api.deepseek.com/"),
+            "https://api.deepseek.com/v1",
+        )
+        self.assertEqual(
+            tasks._normalize_ai_base_url(
+                "https://ark.cn-beijing.volces.com/api/v3/"
+            ),
+            "https://ark.cn-beijing.volces.com/api/v3",
+        )
+        self.assertEqual(
+            tasks._normalize_ai_base_url("https://example.com/v1"),
+            "https://example.com/v1",
+        )
+
     def test_pc_auto_notification_is_disabled(self):
         with (
             patch.dict(

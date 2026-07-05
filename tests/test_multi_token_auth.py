@@ -277,6 +277,89 @@ class MultiTokenAuthTests(unittest.TestCase):
             "ai_config_write",
         )
 
+    def test_chat_api_passes_compressed_history_context(self):
+        expected = {
+            "reply": "回答",
+            "history_summary": "更新后的摘要",
+            "context_compressed": True,
+        }
+        with patch.object(tasks, "ai_chat", return_value=expected) as chat:
+            response = self.client.post(
+                "/api/chat",
+                headers=self._headers(self.beta.token),
+                json={
+                    "filename": "paper.html",
+                    "message": "当前问题",
+                    "history": [{"role": "assistant", "content": "最近回答"}],
+                    "history_summary": "此前摘要",
+                    "web_search": False,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), expected)
+        chat.assert_called_once_with(
+            "paper.html",
+            "当前问题",
+            [{"role": "assistant", "content": "最近回答"}],
+            web_search=False,
+            history_summary="此前摘要",
+        )
+
+        invalid = self.client.post(
+            "/api/chat",
+            headers=self._headers(self.beta.token),
+            json={
+                "filename": "paper.html",
+                "message": "当前问题",
+                "history": "not-a-list",
+            },
+        )
+        self.assertEqual(invalid.status_code, 400)
+
+    def test_ai_config_test_uses_form_values_without_saving_them(self):
+        with tenant_context("t_beta"):
+            before = dict(tasks.load_config().get("ai") or {})
+
+        with patch.object(tasks, "test_ai_connection") as test_connection:
+            response = self.client.post(
+                "/api/ai-config/test",
+                headers=self._headers(self.beta_ai_writer.token),
+                json={
+                    "api_key": "temporary-key",
+                    "base_url": "https://8.8.8.8/api/v3",
+                    "model": "temporary-model",
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.get_json(),
+            {"ok": True, "message": "AI API 测试成功"},
+        )
+        test_connection.assert_called_once_with(
+            "temporary-key",
+            "https://8.8.8.8/api/v3",
+            "temporary-model",
+        )
+        with tenant_context("t_beta"):
+            self.assertEqual(tasks.load_config().get("ai") or {}, before)
+
+        forbidden = self.client.post(
+            "/api/ai-config/test",
+            headers=self._headers(self.beta.token),
+            json={
+                "api_key": "temporary-key",
+                "base_url": "https://8.8.8.8/v1",
+                "model": "temporary-model",
+            },
+        )
+        self.assertEqual(forbidden.status_code, 403)
+        self.assertEqual(
+            forbidden.get_json()["required_scope"],
+            "ai_config_write",
+        )
+
     def test_app_only_token_can_update_own_schedule_and_recommendation(self):
         schedule = self.client.patch(
             "/api/settings/schedule",

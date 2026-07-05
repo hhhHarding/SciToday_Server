@@ -18,6 +18,7 @@ from auth import (
     is_loopback_bind_host,
     load_operator_token,
     operator_token_matches,
+    redact_sensitive_text,
 )
 from ratelimit import RateLimiter, category_for_endpoint
 from server_config import ServerPaths
@@ -116,7 +117,7 @@ TENANT_ADMIN_ENDPOINTS = frozenset(
         "api_admin_rss_reset_time",
     }
 )
-AI_CONFIG_WRITE_ENDPOINTS = frozenset({"api_ai_config"})
+AI_CONFIG_WRITE_ENDPOINTS = frozenset({"api_ai_config", "api_test_ai_config"})
 LEGACY_CONFIG_WRITE_ENDPOINTS = frozenset({"api_save_config"})
 APP_SETTINGS_WRITE_ENDPOINTS = frozenset(
     {"api_save_schedule_settings", "api_save_recommendation_settings"}
@@ -769,6 +770,43 @@ def api_ai_config():
     return jsonify({"ok": True, "ai": _public_ai_connection(cfg)})
 
 
+@app.route("/api/ai-config/test", methods=["POST"])
+def api_test_ai_config():
+    """测试当前表单中的 AI 连接参数，不修改租户已保存的配置。"""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "请求体必须是 JSON 对象"}), 400
+    incoming, error = _validate_ai_connection_payload(
+        data,
+        reject_unknown=True,
+    )
+    if error:
+        return jsonify({"error": error}), 400
+
+    ai = dict(tasks.load_config().get("ai") or {})
+    ai.update(incoming)
+    api_key = str(ai.get("api_key") or "").strip()
+    base_url = str(ai.get("base_url") or "").strip()
+    model = str(ai.get("model") or "").strip()
+    if not api_key:
+        return jsonify({"ok": False, "message": "请填写 API Key"})
+    if not base_url:
+        return jsonify({"ok": False, "message": "请填写 Base URL"})
+    if not model:
+        return jsonify({"ok": False, "message": "请填写 Model"})
+
+    try:
+        tasks.test_ai_connection(api_key, base_url, model)
+    except Exception as exc:
+        detail = redact_sensitive_text(str(exc)).strip()[:500]
+        logger.warning("AI API 测试失败: %s", detail)
+        return jsonify({
+            "ok": False,
+            "message": f"AI API 测试失败：{detail or '未知错误'}",
+        })
+    return jsonify({"ok": True, "message": "AI API 测试成功"})
+
+
 # ── Feed API ────────────────────────────────────────────
 
 @app.route("/api/feeds", methods=["GET"])
@@ -1405,13 +1443,24 @@ def api_chat():
     filename = data.get("filename", "")
     message = data.get("message", "")
     history = data.get("history", []) or []
+    history_summary = data.get("history_summary", "") or ""
     web_search = data.get("web_search", False)
     if not filename or not message:
         return jsonify({"error": "缺少 filename 或 message"}), 400
+    if not isinstance(history, list):
+        return jsonify({"error": "history 必须是数组"}), 400
+    if not isinstance(history_summary, str):
+        return jsonify({"error": "history_summary 必须是字符串"}), 400
     if not isinstance(web_search, bool):
         return jsonify({"error": "web_search 必须是布尔值"}), 400
-    reply = tasks.ai_chat(filename, message, history, web_search=web_search)
-    return jsonify({"reply": reply})
+    result = tasks.ai_chat(
+        filename,
+        message,
+        history,
+        web_search=web_search,
+        history_summary=history_summary,
+    )
+    return jsonify(result)
 
 
 @app.route("/api/pdf")

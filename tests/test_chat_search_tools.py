@@ -1,7 +1,9 @@
 import copy
 import json
+import tempfile
 import unittest
-from unittest.mock import patch
+from pathlib import Path
+from unittest.mock import Mock, patch
 
 import tasks
 
@@ -28,7 +30,11 @@ class ChatSearchToolTests(unittest.TestCase):
 
         with (
             patch.object(tasks, "_cfg", side_effect=self._config_value),
-            patch.object(tasks, "get_digest_text", return_value="测试文章内容"),
+            patch.object(
+                tasks,
+                "_load_chat_pdf_text",
+                return_value=("测试 PDF 原文", None),
+            ),
             patch.object(tasks, "_chat_completion_request", side_effect=fake_completion),
             patch.object(tasks, "record_event"),
         ):
@@ -39,8 +45,9 @@ class ChatSearchToolTests(unittest.TestCase):
                 web_search=True,
             )
 
-        self.assertIn("AI判断无需联网检索", reply)
+        self.assertIn("AI判断无需联网检索", reply["reply"])
         self.assertEqual(len(captured), 1)
+        self.assertIn("测试 PDF 原文", captured[0]["messages"][0]["content"])
         self.assertEqual(
             {tool["function"]["name"] for tool in captured[0]["tools"]},
             {"search_literature", "search_web"},
@@ -85,7 +92,11 @@ class ChatSearchToolTests(unittest.TestCase):
         }
         with (
             patch.object(tasks, "_cfg", side_effect=self._config_value),
-            patch.object(tasks, "get_digest_text", return_value="测试文章内容"),
+            patch.object(
+                tasks,
+                "_load_chat_pdf_text",
+                return_value=("测试 PDF 原文", None),
+            ),
             patch.object(tasks, "_chat_completion_request", side_effect=fake_completion),
             patch.object(tasks, "search_literature", return_value=literature_result) as search,
             patch.object(tasks, "record_event"),
@@ -97,8 +108,8 @@ class ChatSearchToolTests(unittest.TestCase):
                 web_search=True,
             )
 
-        self.assertIn("文献 1 次", reply)
-        self.assertIn("[S1]", reply)
+        self.assertIn("文献 1 次", reply["reply"])
+        self.assertIn("[S1]", reply["reply"])
         search.assert_called_once_with(
             "zircon oxygen isotope granite petrogenesis", 6, None, None
         )
@@ -161,7 +172,11 @@ class ChatSearchToolTests(unittest.TestCase):
 
         with (
             patch.object(tasks, "_cfg", side_effect=self._config_value),
-            patch.object(tasks, "get_digest_text", return_value="测试文章内容"),
+            patch.object(
+                tasks,
+                "_load_chat_pdf_text",
+                return_value=("测试 PDF 原文", None),
+            ),
             patch.object(tasks, "_chat_completion_request", side_effect=fake_completion),
             patch.object(tasks, "search_literature", side_effect=fake_search) as search,
             patch.object(tasks, "record_event"),
@@ -170,7 +185,7 @@ class ChatSearchToolTests(unittest.TestCase):
                 "test.html", "检索相关研究", history=[], web_search=True
             )
 
-        self.assertIn("文献 3 次", reply)
+        self.assertIn("文献 3 次", reply["reply"])
         self.assertEqual(search.call_count, 3)
         tool_messages = [item for item in calls[1] if item.get("role") == "tool"]
         self.assertEqual(len(tool_messages), 3)
@@ -206,15 +221,235 @@ class ChatSearchToolTests(unittest.TestCase):
 
         with (
             patch.object(tasks, "_cfg", side_effect=self._config_value),
-            patch.object(tasks, "get_digest_text", return_value="测试文章内容"),
+            patch.object(
+                tasks,
+                "_load_chat_pdf_text",
+                return_value=("测试 PDF 原文", None),
+            ),
             patch.object(tasks, "_chat_completion_request", side_effect=fake_completion),
         ):
             reply = tasks.ai_chat(
                 "test.html", "解释文章", history=[], web_search=False
             )
 
-        self.assertEqual(reply, "普通回答")
+        self.assertEqual(reply["reply"], "普通回答")
         self.assertEqual(captured, [None])
+
+    def test_pdf_full_text_and_history_are_injected_on_every_turn(self):
+        captured = []
+
+        def fake_completion(messages, api_key, base_url, model, tools=None, timeout=120):
+            captured.append(copy.deepcopy(messages))
+            return {"role": "assistant", "content": "回答"}
+
+        with (
+            patch.object(tasks, "_cfg", side_effect=self._config_value),
+            patch.object(
+                tasks,
+                "_load_chat_pdf_text",
+                return_value=("每轮都必须出现的 PDF 全文", None),
+            ) as load_pdf,
+            patch.object(tasks, "_chat_completion_request", side_effect=fake_completion),
+        ):
+            first = tasks.ai_chat("test.html", "第一问", history=[])
+            second = tasks.ai_chat(
+                "test.html",
+                "第二问",
+                history=[
+                    {"role": "user", "content": "第一问"},
+                    {"role": "assistant", "content": "第一答"},
+                ],
+            )
+
+        self.assertEqual(first["reply"], "回答")
+        self.assertEqual(second["reply"], "回答")
+        self.assertEqual(load_pdf.call_count, 2)
+        for request_messages in captured:
+            self.assertIn(
+                "每轮都必须出现的 PDF 全文",
+                request_messages[0]["content"],
+            )
+        self.assertEqual(
+            [item["content"] for item in captured[1][1:]],
+            ["第一问", "第一答", "第二问"],
+        )
+
+    def test_chat_pdf_loader_reads_all_pages_and_uses_file_identity_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pdf_path = Path(directory) / "source.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\nsource")
+            tasks._cached_chat_pdf_text.cache_clear()
+            with (
+                patch.object(tasks, "resolve_pdf_path", return_value=str(pdf_path)),
+                patch.object(
+                    tasks,
+                    "_extract_pdf_text",
+                    return_value="完整 PDF 文本",
+                ) as extract,
+            ):
+                first = tasks._load_chat_pdf_text("digest.html")
+                second = tasks._load_chat_pdf_text("digest.html")
+
+        self.assertEqual(first, ("完整 PDF 文本", None))
+        self.assertEqual(second, ("完整 PDF 文本", None))
+        extract.assert_called_once_with(pdf_path.resolve(), max_pages=None)
+        tasks._cached_chat_pdf_text.cache_clear()
+
+    def test_missing_or_failed_pdf_stops_before_ai_request(self):
+        completion = Mock()
+        with (
+            patch.object(tasks, "_cfg", side_effect=self._config_value),
+            patch.object(tasks, "resolve_pdf_path", return_value=None),
+            patch.object(tasks, "_chat_completion_request", completion),
+        ):
+            missing = tasks.ai_chat("missing.html", "问题")
+        self.assertIn("未找到", missing["reply"])
+        completion.assert_not_called()
+
+        with tempfile.TemporaryDirectory() as directory:
+            pdf_path = Path(directory) / "broken.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\nbroken")
+            tasks._cached_chat_pdf_text.cache_clear()
+            with (
+                patch.object(tasks, "_cfg", side_effect=self._config_value),
+                patch.object(tasks, "resolve_pdf_path", return_value=str(pdf_path)),
+                patch.object(tasks, "_extract_pdf_text", side_effect=ValueError("bad pdf")),
+                patch.object(tasks, "_chat_completion_request", completion),
+            ):
+                failed = tasks.ai_chat("broken.html", "问题")
+        self.assertIn("提取失败", failed["reply"])
+        completion.assert_not_called()
+        tasks._cached_chat_pdf_text.cache_clear()
+
+        with tempfile.TemporaryDirectory() as directory:
+            pdf_path = Path(directory) / "empty.pdf"
+            pdf_path.write_bytes(b"%PDF-1.4\nempty")
+            tasks._cached_chat_pdf_text.cache_clear()
+            with (
+                patch.object(tasks, "_cfg", side_effect=self._config_value),
+                patch.object(tasks, "resolve_pdf_path", return_value=str(pdf_path)),
+                patch.object(tasks, "_extract_pdf_text", return_value=" \n "),
+                patch.object(tasks, "_chat_completion_request", completion),
+            ):
+                empty = tasks.ai_chat("empty.html", "问题")
+        self.assertIn("提取失败", empty["reply"])
+        completion.assert_not_called()
+        tasks._cached_chat_pdf_text.cache_clear()
+
+    def test_context_overflow_compresses_history_and_retries_with_pdf(self):
+        captured = []
+
+        def fake_completion(messages, api_key, base_url, model, tools=None, timeout=120):
+            captured.append(copy.deepcopy(messages))
+            if len(captured) == 1:
+                raise tasks.AIContextLengthError("too long")
+            if len(captured) == 2:
+                return {"role": "assistant", "content": "压缩后的历史"}
+            return {"role": "assistant", "content": "基于全文的最终回答"}
+
+        with (
+            patch.object(tasks, "_cfg", side_effect=self._config_value),
+            patch.object(
+                tasks,
+                "_load_chat_pdf_text",
+                return_value=("PDF 全文标记", None),
+            ),
+            patch.object(tasks, "_chat_completion_request", side_effect=fake_completion),
+        ):
+            result = tasks.ai_chat(
+                "test.html",
+                "当前问题",
+                history=[
+                    {"role": "user", "content": "旧问题"},
+                    {"role": "assistant", "content": "旧回答"},
+                ],
+                history_summary="更早的摘要",
+            )
+
+        self.assertEqual(result["reply"], "基于全文的最终回答")
+        self.assertTrue(result["context_compressed"])
+        self.assertIn("压缩后的历史", result["history_summary"])
+        self.assertIn("更早的摘要", captured[1][1]["content"])
+        self.assertIn("旧问题", captured[1][1]["content"])
+        self.assertIn("PDF 全文标记", captured[2][0]["content"])
+        self.assertIn("压缩后的历史", captured[2][0]["content"])
+        self.assertEqual(captured[2][-1]["content"], "当前问题")
+
+    def test_context_overflow_is_bounded_to_two_compression_rounds(self):
+        calls = 0
+
+        def fake_completion(messages, api_key, base_url, model, tools=None, timeout=120):
+            nonlocal calls
+            calls += 1
+            if calls in {1, 3, 5}:
+                raise tasks.AIContextLengthError("too long")
+            return {"role": "assistant", "content": f"压缩摘要 {calls}"}
+
+        with (
+            patch.object(tasks, "_cfg", side_effect=self._config_value),
+            patch.object(
+                tasks,
+                "_load_chat_pdf_text",
+                return_value=("PDF 全文", None),
+            ),
+            patch.object(tasks, "_chat_completion_request", side_effect=fake_completion),
+        ):
+            result = tasks.ai_chat(
+                "test.html",
+                "问题",
+                history=[{"role": "user", "content": "很长的历史"}],
+            )
+
+        self.assertEqual(calls, 5)
+        self.assertTrue(result["context_compressed"])
+        self.assertIn("压缩两轮后仍超过", result["reply"])
+
+    def test_non_context_error_does_not_trigger_history_compression(self):
+        with (
+            patch.object(tasks, "_cfg", side_effect=self._config_value),
+            patch.object(
+                tasks,
+                "_load_chat_pdf_text",
+                return_value=("PDF 全文", None),
+            ),
+            patch.object(
+                tasks,
+                "_chat_completion_request",
+                side_effect=RuntimeError("provider unavailable"),
+            ) as completion,
+        ):
+            result = tasks.ai_chat(
+                "test.html",
+                "问题",
+                history=[{"role": "user", "content": "旧问题"}],
+            )
+
+        self.assertEqual(completion.call_count, 1)
+        self.assertFalse(result["context_compressed"])
+        self.assertIn("provider unavailable", result["reply"])
+
+    def test_provider_context_length_error_is_classified(self):
+        response = Mock()
+        response.status_code = 400
+        response.json.return_value = {
+            "error": {
+                "code": "context_length_exceeded",
+                "message": "maximum context length exceeded",
+            }
+        }
+        with (
+            patch.object(tasks, "AI_SESSION") as session,
+            patch.object(tasks, "_safe_ai_endpoint", return_value="https://api.test/v1/chat/completions"),
+        ):
+            session.post.return_value = response
+            with self.assertRaises(tasks.AIContextLengthError):
+                tasks._chat_completion_request(
+                    [{"role": "user", "content": "hello"}],
+                    "key",
+                    "https://api.test/v1",
+                    "model",
+                )
+        response.raise_for_status.assert_not_called()
 
 
 if __name__ == "__main__":

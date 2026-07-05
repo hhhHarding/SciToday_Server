@@ -148,7 +148,10 @@ class TenantDataIsolationTests(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 tasks.get_digest_text("same.html")
             self.assertIsNone(tasks.resolve_pdf_path("same.html"))
-            self.assertIn("无法读取该文章内容", tasks.ai_chat("same.html", "问题"))
+            self.assertIn(
+                "未找到",
+                tasks.ai_chat("same.html", "问题")["reply"],
+            )
 
     def test_same_pdf_and_chunk_ids_are_isolated_and_bound(self):
         saved = {}
@@ -210,6 +213,40 @@ class TenantDataIsolationTests(unittest.TestCase):
                 ).read_text(encoding="utf-8")
             )
             self.assertEqual(meta["tenant_id"], tenant_id)
+
+    def test_parallel_pdf_chunks_are_merged_once_in_index_order(self):
+        chunks = [
+            b"%PDF-1.4\n" + b"a" * 32_000,
+            b"b" * 32_000,
+            b"c" * 32_000,
+            b"d" * 32_000,
+        ]
+
+        def upload(index):
+            with tenant_context("t_alpha"):
+                return tasks.save_uploaded_pdf_chunk(
+                    "parallel-upload",
+                    "parallel.pdf",
+                    index,
+                    len(chunks),
+                    FileStorage(
+                        stream=io.BytesIO(chunks[index]),
+                        filename="parallel.pdf",
+                    ),
+                )
+
+        with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+            results = list(pool.map(upload, range(len(chunks))))
+
+        completed = [result for result in results if result["complete"]]
+        self.assertEqual(len(completed), 1)
+        saved_path = Path(completed[0]["path"])
+        self.assertEqual(saved_path.read_bytes(), b"".join(chunks))
+        self.assertFalse(
+            self._paths("t_alpha").pdf_chunks_dir.joinpath(
+                "parallel-upload"
+            ).exists()
+        )
 
     def test_external_download_scan_is_owner_only_and_explicit(self):
         external = Path(self.temp_dir.name) / "Downloads"
