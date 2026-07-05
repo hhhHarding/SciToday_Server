@@ -1,0 +1,56 @@
+# Generated release trees and packages
+/dist/
+/SciToday_publish/
+
+# Local environments and caches
+/.venv/
+/venv/
+/env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Temporary device/debug captures
+/.tmp_phone/
+/screenshots/
+screen_*.png
+window_*.xml
+
+# Local configuration, feeds, and secrets
+/config.json
+/ai.env
+/feedly.opml
+/tray_config.env
+/quick_tunnel.json
+/tray_command.json
+/local.properties
+
+# Runtime data
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+/Data/
+/inbox/
+/uploaded_pdfs/
+/pdf_upload_chunks/
+/failed_pushes*/
+/backups/
+
+# Build outputs and local binaries
+*.exe
+*.zip
+*.msi
+*.whl
+/wheels/
+cloudflared.exe
+
+# Editor and OS files
+/.idea/
+/.vscode/
+*.iml
+.DS_Store
+Thumbs.db

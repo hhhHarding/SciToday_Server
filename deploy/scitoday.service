@@ -1,0 +1,74 @@
+[Unit]
+# SciToday 后端 —— 替代 Windows 托盘看守(SciToday_admin.exe)的 Linux 常驻方案。
+# 职责: 开机自启 + 崩溃自动重启(对应原托盘的 3 秒 watchdog)。
+Description=SciToday RSS/AI Push Backend
+Documentation=file:/opt/scitoday/SciToday_Server/README_BACKEND.md
+# 等网络就绪再启动(RSS 抓取、AI 调用都需要外网)。
+After=network-online.target
+Wants=network-online.target
+# 防止启动即崩的死循环：60 秒内启动超过 5 次后停止自动重启，等待人工检查。
+# StartLimit* 是 Unit 级指令，必须放在 [Unit]，放入 [Service] 会被忽略。
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# ---- 运行身份 ----
+# 用非 root 专用账户跑, 降低被攻破后的影响面。部署前先创建:
+#   sudo useradd --system --home /opt/scitoday --shell /usr/sbin/nologin scitoday
+User=scitoday
+Group=scitoday
+
+# ---- 路径 ----
+# WorkingDirectory 必须是代码目录(serve.py 所在处)。
+WorkingDirectory=/opt/scitoday/SciToday_Server
+# 所有 RSSAI_* 环境变量从这里加载(与本文件同目录的 scitoday.env)。
+EnvironmentFile=/opt/scitoday/SciToday_Server/deploy/scitoday.env
+
+# ---- 启动命令 ----
+# 用虚拟环境里的 python 跑 serve.py(waitress 生产服务器, 非 flask 开发服务器)。
+# 部署时先建 venv: python3 -m venv /opt/scitoday/venv && \
+#   /opt/scitoday/venv/bin/pip install -r /opt/scitoday/SciToday_Server/requirements.txt
+ExecStart=/opt/scitoday/venv/bin/python serve.py
+# 源码和 venv 由 root 持有且在服务命名空间内只读，不尝试写入 __pycache__。
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+# ---- 自动重启(替代托盘 watchdog)----
+Restart=always
+RestartSec=3
+
+# ---- 优雅停止 ----
+# serve.py 用 SIGTERM 触发 server.close() + 等后台任务安全结束(见 serve.py 的 request_stop)。
+# 给足时间让 SQLite 落盘、任务收尾, 避免硬杀导致数据不一致。
+KillSignal=SIGTERM
+TimeoutStopSec=90
+
+# ---- 生产安全隔离 ----
+# 整个文件系统在本服务的挂载命名空间内只读，只给 ServerData 开写权限。
+# 源码和 venv 在宿主机上也由 root 持有，形成 namespace + Unix 权限双重防线。
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/opt/scitoday/ServerData
+UMask=0077
+
+# ---- 日志 ----
+# stdout/stderr 进 journald。查看: journalctl -u scitoday -f
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=scitoday
+
+[Install]
+WantedBy=multi-user.target

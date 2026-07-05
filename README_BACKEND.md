@@ -1,0 +1,13 @@
+# SciToday PC/Termux Backend
+
+本目录同时支持 Windows PC 和 Termux，不维护平台专用的 `tasks.py` 副本。
+
+- `app.py`：Flask API、调度器和 Web 控制台入口。
+- `tasks.py`：RSS、PDF、数据库、配置和管理任务的唯一实现。
+- `push.py`：按运行环境选择通知通道。
+- `pdf_watch_summarize.py`：已弃用的兼容 CLI 壳。
+- `admin_web/`：Web 管理台。
+- `installer/`：Windows 托盘和 ZIP 安装包构建脚本。
+
+从 `config.example.json` 创建本地 `config.json`。不要提交真实配置、数据库、
+日志、OPML、PDF 或 inbox 内容。
