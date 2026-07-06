@@ -4605,6 +4605,26 @@ def get_recent_digests(limit=None, source=None, recommendation=None):
         return digests
 
 
+def get_digest_stats(source=None):
+    """某来源全库（未删除）卡片总数与已读数。只读，供状态条显示真实口径。"""
+    _sync_digest_index()
+    con = _digest_db()
+    clauses, params = ["deleted=0"], []
+    if source:
+        clauses.append("source=?")
+        params.append(source)
+    where = "WHERE " + " AND ".join(clauses)
+    row = con.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(is_read),0) FROM digests {where}", params
+    ).fetchone()
+    con.close()
+    return {
+        "source": source or "",
+        "total": int(row[0] or 0),
+        "read": int(row[1] or 0),
+    }
+
+
 def get_digest_updates(after=0, limit=50, source=None):
     limit = max(1, min(int(limit or 50), 200))
     after = max(0, int(after or 0))

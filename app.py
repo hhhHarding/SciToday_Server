@@ -1494,6 +1494,12 @@ def api_digests():
     return jsonify(tasks.get_recent_digests(n, source=source, recommendation=recommendation))
 
 
+@app.route("/api/digests/stats")
+def api_digest_stats():
+    source = request.args.get("source") or None
+    return jsonify(tasks.get_digest_stats(source=source))
+
+
 @app.route("/api/digests/updates")
 def api_digest_updates():
     after = request.args.get("after", 0, type=int)
