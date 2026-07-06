@@ -7,7 +7,11 @@
 - `push.py`：按运行环境选择通知通道。
 - `pdf_watch_summarize.py`：已弃用的兼容 CLI 壳。
 - `admin_web/`：Web 管理台。
+- `user_web/`：Vue 公网用户端源码；构建后的 `user_web/dist/` 由 `/user/` 提供。
 - `installer/`：Windows 托盘和 ZIP 安装包构建脚本。
 
 从 `config.example.json` 创建本地 `config.json`。不要提交真实配置、数据库、
 日志、OPML、PDF 或 inbox 内容。
+
+部署前运行 `user_web\build.ps1`，确保发布包包含
+`user_web\dist\index.html`；线上运行不需要 Node.js。

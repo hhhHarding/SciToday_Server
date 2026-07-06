@@ -142,6 +142,73 @@ class TenantRegistryTests(unittest.TestCase):
         self.assertEqual(verified.scopes, ("ai_config_write", "app"))
         self.assertEqual(tenant.id, "t_alpha")
 
+    def test_web_session_tracks_current_token_state_and_never_stores_secrets(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = self._registry(temp_dir)
+            registry.create_tenant("Alpha", tenant_id="t_alpha")
+            issued_token = registry.create_token("t_alpha", scopes=("app",))
+            issued_session = registry.create_web_session(
+                issued_token.record.id,
+                lifetime_seconds=3600,
+                now=100,
+            )
+
+            tenant, token, session = registry.verify_web_session(
+                issued_session.session_token,
+                now=200,
+            )
+            self.assertTrue(
+                registry.verify_web_session_csrf(
+                    session.id,
+                    issued_session.csrf_token,
+                )
+            )
+            self.assertFalse(registry.verify_web_session_csrf(session.id, "wrong"))
+            database_bytes = registry.server_paths.control_db.read_bytes()
+            self.assertNotIn(issued_session.session_token.encode(), database_bytes)
+            self.assertNotIn(issued_session.csrf_token.encode(), database_bytes)
+
+            registry.set_token_scopes(
+                issued_token.record.id,
+                ("app", "ai_config_write"),
+            )
+            _, updated_token, _ = registry.verify_web_session(
+                issued_session.session_token,
+                now=300,
+            )
+            registry.revoke_token(issued_token.record.id, now=350)
+            with self.assertRaises(InvalidTokenError):
+                registry.verify_web_session(issued_session.session_token, now=400)
+
+        self.assertEqual(tenant.id, "t_alpha")
+        self.assertEqual(token.scopes, ("app",))
+        self.assertEqual(updated_token.scopes, ("ai_config_write", "app"))
+
+    def test_web_session_expiry_revocation_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = self._registry(temp_dir)
+            registry.create_tenant("Alpha", tenant_id="t_alpha")
+            issued_token = registry.create_token("t_alpha")
+            expired = registry.create_web_session(
+                issued_token.record.id,
+                lifetime_seconds=60,
+                now=100,
+            )
+            revoked = registry.create_web_session(
+                issued_token.record.id,
+                lifetime_seconds=3600,
+                now=100,
+            )
+            registry.revoke_web_session(revoked.record.id, now=120)
+
+            with self.assertRaises(InvalidTokenError):
+                registry.verify_web_session(expired.session_token, now=161)
+            with self.assertRaises(InvalidTokenError):
+                registry.verify_web_session(revoked.session_token, now=130)
+            removed = registry.purge_expired_web_sessions(now=200)
+
+        self.assertEqual(removed, 2)
+
     def test_revoked_expired_and_suspended_tokens_are_indistinguishable(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             registry = self._registry(temp_dir)

@@ -32,7 +32,7 @@ PROXY_HEADERS = (
 )
 # 完整值替换为占位符的模式（无捕获组）。
 _FULL_REDACT_PATTERNS = (
-    re.compile(r"rssai_(?:tk|op)_[A-Za-z0-9_-]+"),
+    re.compile(r"rssai_(?:tk|op|ws)_[A-Za-z0-9_-]+"),
     # AI 服务密钥（DeepSeek/OpenAI 风格 sk-...）。
     re.compile(r"sk-[A-Za-z0-9_-]{16,}"),
 )

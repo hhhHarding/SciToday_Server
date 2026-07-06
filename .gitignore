@@ -1,6 +1,8 @@
 # Generated release trees and packages
 /dist/
 /SciToday_publish/
+/user_web/node_modules/
+/user_web/dist/
 
 # Local environments and caches
 /.venv/

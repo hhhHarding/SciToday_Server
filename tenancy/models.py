@@ -61,3 +61,21 @@ class IssuedApiToken:
     token: str
     record: ApiToken
 
+
+@dataclass(frozen=True, slots=True)
+class WebSession:
+    id: str
+    tenant_id: str
+    token_id: str
+    created_at: int
+    expires_at: int
+    last_used_at: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class IssuedWebSession:
+    """Browser secrets are returned once; only their hashes are persisted."""
+
+    session_token: str
+    csrf_token: str
+    record: WebSession

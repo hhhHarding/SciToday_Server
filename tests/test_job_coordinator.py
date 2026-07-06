@@ -53,7 +53,7 @@ class TaskCoordinatorTests(unittest.TestCase):
             time.sleep(0.01)
         return False
 
-    def test_schema_v3_is_idempotent_and_has_job_state(self):
+    def test_control_schema_is_idempotent_and_has_job_state(self):
         self.assertEqual(self.registry.initialize(), CONTROL_SCHEMA_VERSION)
         self.assertEqual(self.registry.initialize(), CONTROL_SCHEMA_VERSION)
         con = self.registry._connect()
@@ -68,7 +68,7 @@ class TaskCoordinatorTests(unittest.TestCase):
         finally:
             con.close()
         self.assertIn("job_state", tables)
-        self.assertEqual(version, 3)
+        self.assertEqual(version, CONTROL_SCHEMA_VERSION)
 
     def test_same_tenant_job_is_deduplicated_but_tenants_run_concurrently(self):
         release = threading.Event()

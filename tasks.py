@@ -4964,6 +4964,70 @@ def get_digest_text(filename):
     return "\n\n".join(parts) if parts else ""
 
 
+def get_digest_content(filename):
+    """Return one non-deleted digest as structured, render-safe data."""
+
+    if not filename or "/" in filename or "\\" in filename or ".." in filename:
+        raise ValueError("非法文件名")
+    path = INBOX_DIR / filename
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError("摘要不存在")
+    _sync_digest_index()
+    con = _digest_db()
+    try:
+        row = con.execute(
+            "SELECT source, deleted FROM digests WHERE filename=?",
+            (filename,),
+        ).fetchone()
+    finally:
+        con.close()
+    if row is None or bool(row[1]):
+        raise FileNotFoundError("摘要不存在")
+
+    raw = path.read_text(encoding="utf-8", errors="replace")
+    title_match = re.search(r"<h1[^>]*>(.*?)</h1>", raw, re.S | re.I)
+    if title_match is None:
+        title_match = re.search(r"<title>(.*?)</title>", raw, re.S | re.I)
+    title = ""
+    if title_match:
+        title = re.sub(
+            r"\s+",
+            " ",
+            html_mod.unescape(re.sub(r"<[^>]+>", " ", title_match.group(1))),
+        ).strip()
+
+    content_match = re.search(
+        r'<div\s+class=["\']content["\'][^>]*>(.*?)</div>',
+        raw,
+        re.S | re.I,
+    )
+    content = html_mod.unescape(content_match.group(1)).strip() if content_match else ""
+    created_match = re.search(r"保存时间[：:]\s*([^<\r\n]+)", raw, re.I)
+    created_at = (
+        html_mod.unescape(created_match.group(1)).strip()
+        if created_match
+        else datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    )
+
+    original_url = ""
+    for href in re.findall(r'<a[^>]+href=["\']([^"\']+)["\']', raw, re.I):
+        candidate = html_mod.unescape(href).strip()
+        parsed = urlsplit(candidate)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            original_url = candidate
+            break
+
+    return {
+        "filename": filename,
+        "title": title or filename,
+        "source": row[0] or "rss",
+        "created_at": created_at,
+        "content": content,
+        "original_url": original_url,
+        "pdf_available": bool(resolve_pdf_path(filename)),
+    }
+
+
 def _norm_title(s):
     return re.sub(r"[^a-z0-9一-鿿]+", "", (s or "").lower())
 
@@ -5596,8 +5660,23 @@ def _cached_chat_pdf_text(path_text, size, mtime_ns):
     return _extract_pdf_text(Path(path_text), max_pages=None)
 
 
-def _load_chat_pdf_text(filename):
-    pdf_path = resolve_pdf_path(filename)
+def _load_chat_pdf_text(filename, pdf_filename=""):
+    if pdf_filename:
+        if (
+            Path(pdf_filename).name != pdf_filename
+            or not pdf_filename.lower().endswith(".pdf")
+        ):
+            return None, "选择的 PDF 文件名无效，无法回答。"
+        upload_root = current_tenant_paths().uploaded_pdfs_dir.resolve(strict=False)
+        try:
+            selected_path = (upload_root / pdf_filename).resolve(strict=True)
+        except (FileNotFoundError, OSError):
+            return None, "未找到选择的 PDF，无法回答。"
+        if selected_path.parent != upload_root or not selected_path.is_file():
+            return None, "选择的 PDF 文件名无效，无法回答。"
+        pdf_path = str(selected_path)
+    else:
+        pdf_path = resolve_pdf_path(filename)
     if not pdf_path:
         return None, "未找到该文章对应的 PDF 原文，无法回答。"
     try:
@@ -5883,13 +5962,14 @@ def ai_chat(
     history=None,
     web_search=False,
     history_summary="",
+    pdf_filename="",
 ):
     """基于源 PDF 全文和可压缩历史的多轮对话。"""
     api_key, base_url, model = _ai_config()
     if not api_key:
         return _chat_result("未配置 AI API Key，无法追问。", history_summary)
 
-    pdf_text, pdf_error = _load_chat_pdf_text(filename)
+    pdf_text, pdf_error = _load_chat_pdf_text(filename, pdf_filename)
     if pdf_error:
         return _chat_result(pdf_error, history_summary)
 

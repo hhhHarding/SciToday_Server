@@ -23,6 +23,9 @@
 
 ## 部署步骤
 
+上传前先在源码机执行 `user_web/build.ps1`，并确认包内包含
+`SciToday_Server/user_web/dist/index.html`。线上服务器不需要 Node.js。
+
 ```bash
 # 1) 上传并就位(在服务器上, 假设包已传到 /tmp/SciToday_Server_CHD)
 sudo mkdir -p /opt/scitoday

@@ -59,7 +59,9 @@ class MultiTokenAuthTests(unittest.TestCase):
             TASK_COORDINATOR=self.coordinator,
             OPERATOR_TOKEN="operator-test-token",
             BIND_HOST="127.0.0.1",
+            WEB_COOKIE_SECURE=False,
         )
+        backend.RATE_LIMITER.reset()
         self.client = backend.app.test_client()
 
     def tearDown(self):
@@ -68,6 +70,7 @@ class MultiTokenAuthTests(unittest.TestCase):
         backend.app.config.pop("TASK_COORDINATOR", None)
         backend.app.config.pop("OPERATOR_TOKEN", None)
         backend.app.config.pop("BIND_HOST", None)
+        backend.app.config.pop("WEB_COOKIE_SECURE", None)
         self.tasks_paths_patch.stop()
         tasks._reset_config_cache_for_tests()
         tasks._reset_migration_cache_for_tests()
@@ -108,6 +111,98 @@ class MultiTokenAuthTests(unittest.TestCase):
             ).status_code,
             200,
         )
+
+    def test_web_session_login_csrf_scope_refresh_logout_and_revocation(self):
+        login = self.client.post(
+            "/api/web/session",
+            headers=self._headers(self.beta.token),
+        )
+        self.assertEqual(login.status_code, 200)
+        self.assertNotIn(self.beta.token, login.get_data(as_text=True))
+        self.assertEqual(login.get_json()["principal"]["tenant_id"], "t_beta")
+        csrf_cookie = self.client.get_cookie(backend.WEB_CSRF_COOKIE)
+        self.assertIsNotNone(csrf_cookie)
+
+        restored = self.client.get("/api/web/session")
+        self.assertEqual(restored.status_code, 200)
+        self.assertEqual(restored.get_json()["principal"]["scopes"], ["app"])
+        self.assertEqual(
+            self.client.patch(
+                "/api/settings/recommendation",
+                json={"interest_score_threshold": 75},
+            ).status_code,
+            403,
+        )
+        saved = self.client.patch(
+            "/api/settings/recommendation",
+            headers={"X-CSRF-Token": csrf_cookie.value},
+            json={"interest_score_threshold": 75},
+        )
+        self.assertEqual(saved.status_code, 200)
+        self.assertEqual(
+            self.client.get("/api/admin/local-settings").status_code,
+            403,
+        )
+
+        self.registry.set_token_scopes(
+            self.beta.record.id,
+            ("app", "ai_config_write"),
+        )
+        refreshed = self.client.get("/api/web/session")
+        self.assertEqual(
+            set(refreshed.get_json()["principal"]["scopes"]),
+            {"app", "ai_config_write"},
+        )
+        self.registry.revoke_token(self.beta.record.id)
+        invalid = self.client.get("/api/web/session")
+        self.assertEqual(invalid.status_code, 401)
+        self.assertIn(
+            f"{backend.WEB_SESSION_COOKIE}=;",
+            "\n".join(invalid.headers.getlist("Set-Cookie")),
+        )
+
+    def test_web_session_logout_and_operator_rejection(self):
+        operator = self.client.post(
+            "/api/web/session",
+            headers=self._headers("operator-test-token"),
+        )
+        self.assertEqual(operator.status_code, 403)
+
+        self.client.post("/api/web/session", headers=self._headers(self.alpha.token))
+        csrf = self.client.get_cookie(backend.WEB_CSRF_COOKIE).value
+        logout = self.client.delete(
+            "/api/web/session",
+            headers={"X-CSRF-Token": csrf},
+        )
+        self.assertEqual(logout.status_code, 200)
+        self.assertEqual(self.client.get("/api/web/session").status_code, 401)
+
+    def test_web_session_cookie_is_secure_for_https(self):
+        backend.app.config["WEB_COOKIE_SECURE"] = None
+        response = self.client.post(
+            "/api/web/session",
+            base_url="https://localhost",
+            headers=self._headers(self.alpha.token),
+        )
+        cookies = "\n".join(response.headers.getlist("Set-Cookie"))
+        self.assertIn("Secure", cookies)
+        self.assertIn("HttpOnly", cookies)
+        self.assertIn("SameSite=Strict", cookies)
+
+    def test_web_session_login_is_rate_limited_by_remote_address(self):
+        backend.RATE_LIMITER.reset()
+        for _ in range(10):
+            response = self.client.post(
+                "/api/web/session",
+                headers=self._headers("not-a-valid-token"),
+            )
+            self.assertEqual(response.status_code, 401)
+        limited = self.client.post(
+            "/api/web/session",
+            headers=self._headers("not-a-valid-token"),
+        )
+        self.assertEqual(limited.status_code, 429)
+        self.assertEqual(limited.get_json()["category"], "web_login")
 
     def test_tokens_map_to_exact_tenant_and_context_resets(self):
         alpha = self.client.get(
@@ -293,6 +388,7 @@ class MultiTokenAuthTests(unittest.TestCase):
                     "history": [{"role": "assistant", "content": "最近回答"}],
                     "history_summary": "此前摘要",
                     "web_search": False,
+                    "pdf_filename": "selected.pdf",
                 },
             )
 
@@ -304,6 +400,7 @@ class MultiTokenAuthTests(unittest.TestCase):
             [{"role": "assistant", "content": "最近回答"}],
             web_search=False,
             history_summary="此前摘要",
+            pdf_filename="selected.pdf",
         )
 
         invalid = self.client.post(
@@ -565,6 +662,49 @@ class MultiTokenAuthTests(unittest.TestCase):
         )
         alpha_inbox.close()
         beta_inbox.close()
+
+    def test_structured_digest_content_is_tenant_scoped_and_hides_deleted_items(self):
+        with tenant_context("t_alpha"):
+            paths = tasks.current_tenant_paths()
+            paths.inbox_dir.mkdir(parents=True, exist_ok=True)
+            filename = "20260706_120000_aaaaaaaaaaaaaaaaaaaaaaaa.html"
+            (paths.inbox_dir / filename).write_text(
+                """<!doctype html><html><head>
+                <meta name="digest-source" content="rss"><title>Alpha title</title>
+                </head><body><h1>Alpha title</h1>
+                <div class="meta">保存时间：2026-07-06 12:00:00</div>
+                <div class="actions"><a href="index.html">返回</a>
+                <a href="https://example.com/paper">原文</a></div>
+                <div class="content">&lt;b&gt;plain text&lt;/b&gt;</div>
+                </body></html>""",
+                encoding="utf-8",
+            )
+            tasks._sync_digest_index(force=True)
+
+        content = self.client.get(
+            f"/api/digests/{filename}/content",
+            headers=self._headers(self.alpha.token),
+        )
+        self.assertEqual(content.status_code, 200)
+        body = content.get_json()
+        self.assertEqual(body["title"], "Alpha title")
+        self.assertEqual(body["content"], "<b>plain text</b>")
+        self.assertEqual(body["original_url"], "https://example.com/paper")
+
+        beta = self.client.get(
+            f"/api/digests/{filename}/content",
+            headers=self._headers(self.beta.token),
+        )
+        self.assertEqual(beta.status_code, 404)
+        self.client.delete(
+            f"/api/digests/{filename}",
+            headers=self._headers(self.alpha.token),
+        )
+        deleted = self.client.get(
+            f"/api/digests/{filename}/content",
+            headers=self._headers(self.alpha.token),
+        )
+        self.assertEqual(deleted.status_code, 404)
 
     def test_manual_task_thread_keeps_tenant_and_progress_is_private(self):
         finished = threading.Event()

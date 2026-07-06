@@ -295,6 +295,35 @@ class ChatSearchToolTests(unittest.TestCase):
         extract.assert_called_once_with(pdf_path.resolve(), max_pages=None)
         tasks._cached_chat_pdf_text.cache_clear()
 
+    def test_chat_pdf_loader_accepts_only_current_tenant_uploaded_pdf(self):
+        with tempfile.TemporaryDirectory() as directory:
+            upload_root = Path(directory) / "uploaded_pdfs"
+            upload_root.mkdir()
+            selected = upload_root / "selected.pdf"
+            selected.write_bytes(b"%PDF-1.4\nselected")
+            paths = type("Paths", (), {"uploaded_pdfs_dir": upload_root})()
+            tasks._cached_chat_pdf_text.cache_clear()
+            with (
+                patch.object(tasks, "current_tenant_paths", return_value=paths),
+                patch.object(
+                    tasks,
+                    "_extract_pdf_text",
+                    return_value="选择的 PDF 全文",
+                ),
+            ):
+                loaded = tasks._load_chat_pdf_text(
+                    "digest.html",
+                    "selected.pdf",
+                )
+                escaped = tasks._load_chat_pdf_text(
+                    "digest.html",
+                    "../selected.pdf",
+                )
+
+        self.assertEqual(loaded, ("选择的 PDF 全文", None))
+        self.assertIn("无效", escaped[1])
+        tasks._cached_chat_pdf_text.cache_clear()
+
     def test_missing_or_failed_pdf_stops_before_ai_request(self):
         completion = Mock()
         with (

@@ -17,7 +17,15 @@ from typing import Any, Iterable
 from server_config import ServerPaths
 
 from .config_io import atomic_write_json, atomic_write_text
-from .models import ApiToken, IssuedApiToken, Tenant, TenantQuota, TenantStatus
+from .models import (
+    ApiToken,
+    IssuedApiToken,
+    IssuedWebSession,
+    Tenant,
+    TenantQuota,
+    TenantStatus,
+    WebSession,
+)
 from .paths import (
     TenantPaths,
     ensure_safe_path,
@@ -26,10 +34,11 @@ from .paths import (
 )
 
 
-CONTROL_SCHEMA_VERSION = 3
+CONTROL_SCHEMA_VERSION = 4
 TOKEN_LAST_USED_WRITE_INTERVAL = 300
 TOKEN_ID_RE = re.compile(r"^[0-9a-f]{16}$")
 TOKEN_RE = re.compile(r"^rssai_tk_([0-9a-f]{16})_([A-Za-z0-9_-]{32,})$")
+WEB_SESSION_RE = re.compile(r"^rssai_ws_([0-9a-f]{16})_([A-Za-z0-9_-]{32,})$")
 VALID_TOKEN_SCOPES = frozenset({"app", "ai_config_write", "tenant_admin"})
 EMPTY_OPML = """<?xml version="1.0" encoding="UTF-8"?>
 <opml version="2.0">
@@ -159,6 +168,23 @@ class TenantRegistry:
             con.execute(
                 """CREATE INDEX IF NOT EXISTS idx_job_state_due
                 ON job_state(enabled, next_run_at, status)"""
+            )
+            con.execute(
+                """CREATE TABLE IF NOT EXISTS web_sessions(
+                    id TEXT PRIMARY KEY,
+                    session_hash TEXT NOT NULL UNIQUE,
+                    csrf_hash TEXT NOT NULL,
+                    tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+                    token_id TEXT NOT NULL REFERENCES api_tokens(id) ON DELETE CASCADE,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    last_used_at INTEGER,
+                    revoked_at INTEGER
+                )"""
+            )
+            con.execute(
+                """CREATE INDEX IF NOT EXISTS idx_web_sessions_expiry
+                ON web_sessions(expires_at, revoked_at)"""
             )
             con.execute(f"PRAGMA user_version={CONTROL_SCHEMA_VERSION}")
             con.commit()
@@ -872,6 +898,244 @@ class TenantRegistry:
         finally:
             con.close()
         return [self._token_from_row(row) for row in rows]
+
+    def create_web_session(
+        self,
+        token_id: str,
+        *,
+        lifetime_seconds: int,
+        now: int | None = None,
+    ) -> IssuedWebSession:
+        """Create a revocable browser session for an active tenant token."""
+
+        self.initialize()
+        normalized_id = str(token_id or "").strip().lower()
+        if not TOKEN_ID_RE.fullmatch(normalized_id):
+            raise InvalidTokenError("invalid credentials")
+        created_at = int(time.time() if now is None else now)
+        lifetime = max(60, int(lifetime_seconds))
+        session_id = secrets.token_hex(8)
+        secret = secrets.token_urlsafe(48)
+        csrf_token = secrets.token_urlsafe(32)
+        plaintext = f"rssai_ws_{session_id}_{secret}"
+
+        con = self._connect()
+        try:
+            row = con.execute(
+                """SELECT tok.tenant_id, tok.status, tok.revoked_at, tok.expires_at,
+                    tenant.status AS tenant_status
+                FROM api_tokens AS tok
+                JOIN tenants AS tenant ON tenant.id=tok.tenant_id
+                WHERE tok.id=?""",
+                (normalized_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["status"] != "active"
+                or row["revoked_at"] is not None
+                or row["tenant_status"] != TenantStatus.ACTIVE.value
+                or (
+                    row["expires_at"] is not None
+                    and int(row["expires_at"]) <= created_at
+                )
+            ):
+                raise InvalidTokenError("invalid credentials")
+            expires_at = created_at + lifetime
+            con.execute(
+                """INSERT INTO web_sessions(
+                    id, session_hash, csrf_hash, tenant_id, token_id,
+                    created_at, expires_at, last_used_at
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    self._hash_token(plaintext),
+                    self._hash_token(csrf_token),
+                    row["tenant_id"],
+                    normalized_id,
+                    created_at,
+                    expires_at,
+                    created_at,
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+        return IssuedWebSession(
+            session_token=plaintext,
+            csrf_token=csrf_token,
+            record=WebSession(
+                id=session_id,
+                tenant_id=row["tenant_id"],
+                token_id=normalized_id,
+                created_at=created_at,
+                expires_at=expires_at,
+                last_used_at=created_at,
+            ),
+        )
+
+    def verify_web_session(
+        self,
+        plaintext: str,
+        *,
+        now: int | None = None,
+        last_used_interval: int = TOKEN_LAST_USED_WRITE_INTERVAL,
+    ) -> tuple[Tenant, ApiToken, WebSession]:
+        """Validate a browser session and its current tenant/token state."""
+
+        match = WEB_SESSION_RE.fullmatch(str(plaintext or ""))
+        if match is None:
+            raise InvalidTokenError("invalid credentials")
+        session_id = match.group(1)
+        checked_at = int(time.time() if now is None else now)
+        self.initialize()
+        con = self._connect()
+        try:
+            row = con.execute(
+                """SELECT ws.*, tok.token_prefix, tok.scopes_json,
+                    tok.status AS token_status, tok.created_at AS token_created_at,
+                    tok.last_used_at AS token_last_used_at,
+                    tok.expires_at AS token_expires_at,
+                    tok.revoked_at AS token_revoked_at,
+                    tenant.display_name, tenant.status AS tenant_status,
+                    tenant.quota_json, tenant.config_version,
+                    tenant.created_at AS tenant_created_at,
+                    tenant.updated_at AS tenant_updated_at
+                FROM web_sessions AS ws
+                JOIN api_tokens AS tok ON tok.id=ws.token_id
+                JOIN tenants AS tenant ON tenant.id=ws.tenant_id
+                WHERE ws.id=?""",
+                (session_id,),
+            ).fetchone()
+            if (
+                row is None
+                or row["revoked_at"] is not None
+                or int(row["expires_at"]) <= checked_at
+                or row["token_status"] != "active"
+                or row["token_revoked_at"] is not None
+                or row["tenant_status"] != TenantStatus.ACTIVE.value
+                or (
+                    row["token_expires_at"] is not None
+                    and int(row["token_expires_at"]) <= checked_at
+                )
+                or not hmac.compare_digest(
+                    str(row["session_hash"]),
+                    self._hash_token(plaintext),
+                )
+            ):
+                raise InvalidTokenError("invalid credentials")
+
+            last_used_at = (
+                int(row["last_used_at"]) if row["last_used_at"] is not None else None
+            )
+            if (
+                last_used_at is None
+                or checked_at - last_used_at >= max(0, int(last_used_interval))
+            ):
+                con.execute(
+                    "UPDATE web_sessions SET last_used_at=? WHERE id=?",
+                    (checked_at, session_id),
+                )
+                con.commit()
+                last_used_at = checked_at
+
+            try:
+                scopes = tuple(json.loads(row["scopes_json"] or "[]"))
+            except (TypeError, json.JSONDecodeError):
+                scopes = ()
+            tenant = self._tenant_from_mapping({
+                "id": row["tenant_id"],
+                "display_name": row["display_name"],
+                "status": row["tenant_status"],
+                "quota_json": row["quota_json"],
+                "config_version": row["config_version"],
+                "created_at": row["tenant_created_at"],
+                "updated_at": row["tenant_updated_at"],
+            })
+            token = ApiToken(
+                id=row["token_id"],
+                tenant_id=row["tenant_id"],
+                token_prefix=row["token_prefix"],
+                scopes=scopes,
+                status=row["token_status"],
+                created_at=int(row["token_created_at"]),
+                last_used_at=(
+                    int(row["token_last_used_at"])
+                    if row["token_last_used_at"] is not None
+                    else None
+                ),
+                expires_at=(
+                    int(row["token_expires_at"])
+                    if row["token_expires_at"] is not None
+                    else None
+                ),
+                revoked_at=(
+                    int(row["token_revoked_at"])
+                    if row["token_revoked_at"] is not None
+                    else None
+                ),
+            )
+            session = WebSession(
+                id=row["id"],
+                tenant_id=row["tenant_id"],
+                token_id=row["token_id"],
+                created_at=int(row["created_at"]),
+                expires_at=int(row["expires_at"]),
+                last_used_at=last_used_at,
+            )
+            return tenant, token, session
+        finally:
+            con.close()
+
+    def verify_web_session_csrf(self, session_id: str, csrf_token: str) -> bool:
+        self.initialize()
+        if not TOKEN_ID_RE.fullmatch(str(session_id or "")):
+            return False
+        con = self._connect()
+        try:
+            row = con.execute(
+                "SELECT csrf_hash FROM web_sessions WHERE id=? AND revoked_at IS NULL",
+                (session_id,),
+            ).fetchone()
+        finally:
+            con.close()
+        return bool(
+            row
+            and csrf_token
+            and hmac.compare_digest(
+                str(row["csrf_hash"]),
+                self._hash_token(str(csrf_token)),
+            )
+        )
+
+    def revoke_web_session(self, session_id: str, *, now: int | None = None) -> bool:
+        self.initialize()
+        if not TOKEN_ID_RE.fullmatch(str(session_id or "")):
+            return False
+        con = self._connect()
+        try:
+            cursor = con.execute(
+                """UPDATE web_sessions SET revoked_at=?
+                WHERE id=? AND revoked_at IS NULL""",
+                (int(time.time() if now is None else now), session_id),
+            )
+            con.commit()
+            return cursor.rowcount == 1
+        finally:
+            con.close()
+
+    def purge_expired_web_sessions(self, *, now: int | None = None) -> int:
+        self.initialize()
+        cutoff = int(time.time() if now is None else now)
+        con = self._connect()
+        try:
+            cursor = con.execute(
+                "DELETE FROM web_sessions WHERE expires_at<=? OR revoked_at IS NOT NULL",
+                (cutoff,),
+            )
+            con.commit()
+            return int(cursor.rowcount)
+        finally:
+            con.close()
 
     @staticmethod
     def _hash_token(plaintext: str) -> str:

@@ -29,6 +29,7 @@ DEFAULT_RULES: dict[str, Rule] = {
     "ai": Rule(max_requests=10, window_seconds=60),
     "upload": Rule(max_requests=30, window_seconds=60),
     "task": Rule(max_requests=10, window_seconds=60),
+    "web_login": Rule(max_requests=10, window_seconds=60),
 }
 
 
@@ -90,6 +91,8 @@ class RateLimiter:
 # 端点前缀 → 类别的归类规则。按顺序匹配 request.endpoint。
 def category_for_endpoint(endpoint: str | None) -> str:
     name = endpoint or ""
+    if name == "web_session":
+        return "web_login"
     if name in ("api_chat", "api_test_ai_config"):
         return "ai"
     if name in ("upload_pdf", "upload_pdf_chunk"):

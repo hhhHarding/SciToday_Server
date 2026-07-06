@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from flask import Flask, g, jsonify, request, send_file, send_from_directory
+from flask import Flask, g, jsonify, redirect, request, send_file, send_from_directory
 
 from auth import (
     AuthPrincipal,
@@ -83,9 +83,14 @@ def _trusted_hosts():
 app.config["TRUSTED_HOSTS"] = _trusted_hosts()
 APP_ROOT = Path(__file__).resolve().parent
 ADMIN_STATIC_DIR = APP_ROOT / "admin_web"
+USER_STATIC_DIR = APP_ROOT / "user_web" / "dist"
 TENANT_REGISTRY = TenantRegistry(SERVER_PATHS)
 RATE_LIMITER = RateLimiter()
-PUBLIC_ENDPOINTS = frozenset({"index", "healthz", "admin_web"})
+PUBLIC_ENDPOINTS = frozenset({"index", "healthz", "admin_web", "user_web"})
+WEB_SESSION_COOKIE = "scitoday_user_session"
+WEB_CSRF_COOKIE = "scitoday_csrf"
+WEB_SESSION_LIFETIME_SECONDS = 30 * 24 * 60 * 60
+SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 OPERATOR_ENDPOINTS = frozenset(
     {
         "api_admin_local_settings",
@@ -222,8 +227,10 @@ def _is_local_request():
     )
 
 
-def _set_request_principal(principal):
+def _set_request_principal(principal, *, web_session=None):
     g.auth_principal = principal
+    g.web_session = web_session
+    g.auth_via_web_session = web_session is not None
     g.tenant_context_reset_token = set_current_tenant_id(principal.tenant_id)
 
 
@@ -250,14 +257,56 @@ def _host_is_trusted():
     return host_is_trusted(request.host, trusted)
 
 
+def _cookie_secure():
+    configured = app.config.get("WEB_COOKIE_SECURE")
+    if configured is not None:
+        return bool(configured)
+    return bool(
+        request.is_secure
+        or request.headers.get("X-Forwarded-Proto", "").lower() == "https"
+    )
+
+
+def _clear_web_cookies(response):
+    response.delete_cookie(
+        WEB_SESSION_COOKIE,
+        path="/",
+        secure=_cookie_secure(),
+        httponly=True,
+        samesite="Strict",
+    )
+    response.delete_cookie(
+        WEB_CSRF_COOKIE,
+        path="/",
+        secure=_cookie_secure(),
+        httponly=False,
+        samesite="Strict",
+    )
+    return response
+
+
 @app.before_request
 def _require_auth():
     g.auth_principal = None
+    g.web_session = None
+    g.auth_via_web_session = False
+    g.clear_web_session_cookies = False
     g.tenant_context_reset_token = None
     if not _host_is_trusted():
         return jsonify({"error": "bad_host"}), 400
     if request.endpoint in PUBLIC_ENDPOINTS:
         return None
+
+    if request.endpoint == "web_session" and request.method == "POST":
+        decision = RATE_LIMITER.check(
+            "web_login",
+            request.remote_addr or "unknown",
+        )
+        if not decision.allowed:
+            response = jsonify({"error": "too_many_requests", "category": "web_login"})
+            response.status_code = 429
+            response.headers["Retry-After"] = str(decision.retry_after)
+            return response
 
     if (
         insecure_dev_mode_requested()
@@ -274,37 +323,62 @@ def _require_auth():
         return None
 
     provided = _provided_bearer_token()
-    if not provided:
-        return jsonify({"error": "unauthorized"}), 401
-
-    operator_token = load_operator_token(
-        SERVER_PATHS,
-        explicit_token=app.config.get("OPERATOR_TOKEN"),
-    )
-    if operator_token_matches(provided, operator_token):
-        if not _is_local_request():
-            return jsonify({"error": "forbidden"}), 403
+    token = None
+    if provided:
+        operator_token = load_operator_token(
+            SERVER_PATHS,
+            explicit_token=app.config.get("OPERATOR_TOKEN"),
+        )
+        if operator_token_matches(provided, operator_token):
+            if not _is_local_request():
+                return jsonify({"error": "forbidden"}), 403
+            _set_request_principal(
+                AuthPrincipal(
+                    kind="operator",
+                    tenant_id=OWNER_TENANT_ID,
+                    scopes=frozenset({"operator", "app", "tenant_admin"}),
+                )
+            )
+            return None
+        try:
+            tenant, token = _registry().verify_token(provided)
+        except InvalidTokenError:
+            return jsonify({"error": "unauthorized"}), 401
         _set_request_principal(
             AuthPrincipal(
-                kind="operator",
-                tenant_id=OWNER_TENANT_ID,
-                scopes=frozenset({"operator", "app", "tenant_admin"}),
+                kind="tenant",
+                tenant_id=tenant.id,
+                scopes=frozenset(token.scopes),
+                token_id=token.id,
             )
         )
-        return None
-
-    try:
-        tenant, token = _registry().verify_token(provided)
-    except InvalidTokenError:
-        return jsonify({"error": "unauthorized"}), 401
-    _set_request_principal(
-        AuthPrincipal(
-            kind="tenant",
-            tenant_id=tenant.id,
-            scopes=frozenset(token.scopes),
-            token_id=token.id,
+    else:
+        session_cookie = request.cookies.get(WEB_SESSION_COOKIE, "")
+        if not session_cookie:
+            return jsonify({"error": "unauthorized"}), 401
+        try:
+            tenant, token, web_session_record = _registry().verify_web_session(
+                session_cookie
+            )
+        except InvalidTokenError:
+            g.clear_web_session_cookies = True
+            return jsonify({"error": "unauthorized"}), 401
+        _set_request_principal(
+            AuthPrincipal(
+                kind="tenant",
+                tenant_id=tenant.id,
+                scopes=frozenset(token.scopes),
+                token_id=token.id,
+            ),
+            web_session=web_session_record,
         )
-    )
+        if request.path.startswith("/api/admin/"):
+            return jsonify({"error": "forbidden"}), 403
+        if request.method not in SAFE_METHODS:
+            csrf = request.headers.get("X-CSRF-Token", "")
+            if not _registry().verify_web_session_csrf(web_session_record.id, csrf):
+                return jsonify({"error": "csrf_failed"}), 403
+
     if request.endpoint in OPERATOR_ENDPOINTS:
         return jsonify({"error": "forbidden"}), 403
     if (
@@ -337,6 +411,8 @@ def _require_auth():
             "error": "forbidden",
             "required_scope": "app",
         }), 403
+    if request.endpoint == "web_session":
+        return None
     return _rate_limit_response(g.auth_principal)
 
 
@@ -344,14 +420,28 @@ def _require_auth():
 def _security_headers(response):
     """统一安全响应头。CORS 保持关闭：App 是原生客户端，不需要跨域头。"""
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "DENY")
+    if request.endpoint == "api_pdf":
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    else:
+        response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     # admin_web 是本地静态页，只用同源资源；给一个保守的 CSP。
-    response.headers.setdefault(
-        "Content-Security-Policy",
-        "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
-        "object-src 'none'; frame-ancestors 'none'",
-    )
+    if request.endpoint == "api_pdf":
+        response.headers["Content-Security-Policy"] = "frame-ancestors 'self'"
+    else:
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data:; "
+            "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+            "object-src 'self'; frame-src 'self'; frame-ancestors 'none'",
+        )
+    if request.endpoint == "user_web":
+        if request.path == "/user/" or request.path.endswith("/index.html"):
+            response.headers["Cache-Control"] = "no-store"
+        elif "/user/assets/" in request.path:
+            response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    if getattr(g, "clear_web_session_cookies", False):
+        _clear_web_cookies(response)
     # 经 https（隧道）访问时启用 HSTS；本机 http 不设，避免污染 loopback。
     if request.is_secure or request.headers.get("X-Forwarded-Proto") == "https":
         response.headers.setdefault(
@@ -386,6 +476,86 @@ def admin_web(filename="index.html"):
     if not filename or filename == "/":
         filename = "index.html"
     return send_from_directory(ADMIN_STATIC_DIR, filename)
+
+
+@app.route("/user")
+@app.route("/user/")
+@app.route("/user/<path:filename>")
+def user_web(filename="index.html"):
+    if request.path == "/user":
+        return redirect("/user/", code=308)
+    requested = filename or "index.html"
+    candidate = USER_STATIC_DIR / requested
+    if requested != "index.html" and candidate.is_file():
+        return send_from_directory(USER_STATIC_DIR, requested)
+    if not (USER_STATIC_DIR / "index.html").is_file():
+        return jsonify({"error": "user_frontend_not_built"}), 503
+    return send_from_directory(USER_STATIC_DIR, "index.html")
+
+
+def _web_session_payload(principal, *, expires_at):
+    tenant = _registry().get_tenant(principal.tenant_id)
+    return {
+        "tenant_id": principal.tenant_id,
+        "display_name": tenant.display_name,
+        "kind": principal.kind,
+        "scopes": sorted(principal.scopes),
+        "expires_at": int(expires_at),
+    }
+
+
+@app.route("/api/web/session", methods=["GET", "POST", "DELETE"])
+def web_session():
+    principal = g.auth_principal
+    if principal.kind != "tenant" or not principal.token_id:
+        return jsonify({"error": "forbidden"}), 403
+
+    if request.method == "POST":
+        _registry().purge_expired_web_sessions()
+        issued = _registry().create_web_session(
+            principal.token_id,
+            lifetime_seconds=WEB_SESSION_LIFETIME_SECONDS,
+        )
+        response = jsonify({
+            "ok": True,
+            "principal": _web_session_payload(
+                principal,
+                expires_at=issued.record.expires_at,
+            ),
+        })
+        response.set_cookie(
+            WEB_SESSION_COOKIE,
+            issued.session_token,
+            max_age=WEB_SESSION_LIFETIME_SECONDS,
+            secure=_cookie_secure(),
+            httponly=True,
+            samesite="Strict",
+            path="/",
+        )
+        response.set_cookie(
+            WEB_CSRF_COOKIE,
+            issued.csrf_token,
+            max_age=WEB_SESSION_LIFETIME_SECONDS,
+            secure=_cookie_secure(),
+            httponly=False,
+            samesite="Strict",
+            path="/",
+        )
+        return response
+
+    current = g.web_session
+    if current is None:
+        return jsonify({"error": "unauthorized"}), 401
+    if request.method == "DELETE":
+        _registry().revoke_web_session(current.id)
+        return _clear_web_cookies(jsonify({"ok": True}))
+    return jsonify({
+        "ok": True,
+        "principal": _web_session_payload(
+            principal,
+            expires_at=current.expires_at,
+        ),
+    })
 
 
 @app.route("/api/admin/session", methods=["POST"])
@@ -1332,6 +1502,16 @@ def api_digest_updates():
     return jsonify(tasks.get_digest_updates(after=after, limit=n, source=source))
 
 
+@app.route("/api/digests/<filename>/content")
+def api_digest_content(filename):
+    try:
+        return jsonify(tasks.get_digest_content(filename))
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except FileNotFoundError:
+        return jsonify({"error": "摘要不存在"}), 404
+
+
 @app.route("/api/digests/<filename>/flags", methods=["GET", "PATCH"])
 def api_digest_flags(filename):
     try:
@@ -1445,6 +1625,7 @@ def api_chat():
     history = data.get("history", []) or []
     history_summary = data.get("history_summary", "") or ""
     web_search = data.get("web_search", False)
+    pdf_filename = data.get("pdf_filename", "") or ""
     if not filename or not message:
         return jsonify({"error": "缺少 filename 或 message"}), 400
     if not isinstance(history, list):
@@ -1453,12 +1634,15 @@ def api_chat():
         return jsonify({"error": "history_summary 必须是字符串"}), 400
     if not isinstance(web_search, bool):
         return jsonify({"error": "web_search 必须是布尔值"}), 400
+    if not isinstance(pdf_filename, str) or len(pdf_filename) > 255:
+        return jsonify({"error": "pdf_filename 必须是有效文件名"}), 400
     result = tasks.ai_chat(
         filename,
         message,
         history,
         web_search=web_search,
         history_summary=history_summary,
+        pdf_filename=pdf_filename,
     )
     return jsonify(result)
 
