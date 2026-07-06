@@ -2525,6 +2525,37 @@ topics/journals/keywords/methods 的元素格式为 {"name":"...","weight":0到1
         return get_interest_profile()
 
 
+def set_interest_profile(data):
+    """手动覆盖当前租户的兴趣画像（校验后写入，版本号 +1）。
+
+    与 refresh_interest_profile 的区别：不调用 AI、不依赖行为样本，直接采用调用方
+    提供的画像内容。仅做结构校验与裁剪，写入即推进 version 并标记 ready。
+    """
+    if not isinstance(data, dict):
+        raise ValueError("画像内容必须是 JSON 对象")
+    profile = _validate_interest_profile(data)
+    now = int(time.time())
+    con = _admin_db()
+    con.execute("""UPDATE interest_profile SET profile_json=?, version=version+1,
+        generated_ts=?, status='ready', error='' WHERE id=1""",
+                (_json_dumps(profile), now))
+    con.commit()
+    version = con.execute(
+        "SELECT version FROM interest_profile WHERE id=1"
+    ).fetchone()[0]
+    con.close()
+    record_event("interest_profile", f"兴趣画像已手动更新 v{version}", details={
+        "version": version,
+        "source": "manual_edit",
+    })
+    return {
+        "profile": profile,
+        "version": version,
+        "generated_ts": now,
+        "active_count": _interest_profile_state()["active_count"],
+    }
+
+
 def schedule_interest_profile_refresh(force=False):
     tenant_id = get_current_tenant_id()
     state = _interest_profile_state()
@@ -3900,6 +3931,14 @@ def run_pdf_watch(progress_callback=None):
                 filename, ts, paper["title"], msg, source="pdf",
                 cn_title=cn_title, keywords=keywords, journal=journal,
             )
+            # PDF 匹配到的文章默认标记为“感兴趣”。update_digest_flags 是幂等 UPDATE，
+            # 已是 interested=1 时不产生额外变化，因此不会重复添加。
+            try:
+                update_digest_flags(filename, interested=True)
+            except Exception as flag_error:
+                logger.warning(
+                    "PDF 匹配默认感兴趣标记失败: %s | %s", filename, flag_error
+                )
             _record_pdf_preference(paper["id"], fallback_filename=filename)
             push.send_pdf_notification(cn_title, keywords, filename, config=cfg)
             logger.info(

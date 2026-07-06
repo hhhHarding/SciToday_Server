@@ -1647,6 +1647,24 @@ def api_chat():
     return jsonify(result)
 
 
+@app.route("/api/interest-profile", methods=["GET"])
+def api_get_interest_profile():
+    # 只读返回当前租户的兴趣画像；无画像时返回空对象（前端据此显示“暂无画像”）。
+    return jsonify(tasks.get_interest_profile() or {})
+
+
+@app.route("/api/interest-profile", methods=["PUT"])
+def api_set_interest_profile():
+    # 手动覆盖当前租户画像。前端当前只读，此端点供后续编辑能力使用。
+    data = request.get_json(silent=True)
+    profile_input = data.get("profile") if isinstance(data, dict) and "profile" in data else data
+    try:
+        result = tasks.set_interest_profile(profile_input)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify(result)
+
+
 @app.route("/api/pdf")
 def api_pdf():
     filename = request.args.get("filename", "")
