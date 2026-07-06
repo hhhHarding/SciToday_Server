@@ -706,6 +706,35 @@ class MultiTokenAuthTests(unittest.TestCase):
         alpha_inbox.close()
         beta_inbox.close()
 
+    def test_ai_digest_search_validates_input_and_uses_authenticated_tenant(self):
+        with patch.object(tasks, "ai_search_digests") as search:
+            search.return_value = {
+                "query": "microglia",
+                "candidate_count": 1,
+                "ai_ranked": True,
+                "items": [],
+            }
+            missing = self.client.post(
+                "/api/digests/ai-search",
+                json={},
+                headers=self._headers(self.alpha.token),
+            )
+            too_long = self.client.post(
+                "/api/digests/ai-search",
+                json={"query": "x" * 201},
+                headers=self._headers(self.alpha.token),
+            )
+            success = self.client.post(
+                "/api/digests/ai-search",
+                json={"query": " microglia "},
+                headers=self._headers(self.alpha.token),
+            )
+
+        self.assertEqual(missing.status_code, 400)
+        self.assertEqual(too_long.status_code, 400)
+        self.assertEqual(success.status_code, 200)
+        search.assert_called_once_with("microglia")
+
     def test_structured_digest_content_is_tenant_scoped_and_hides_deleted_items(self):
         with tenant_context("t_alpha"):
             paths = tasks.current_tenant_paths()

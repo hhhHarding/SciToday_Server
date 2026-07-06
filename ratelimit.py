@@ -93,7 +93,7 @@ def category_for_endpoint(endpoint: str | None) -> str:
     name = endpoint or ""
     if name == "web_session":
         return "web_login"
-    if name in ("api_chat", "api_test_ai_config"):
+    if name in ("api_chat", "api_test_ai_config", "api_ai_search_digests"):
         return "ai"
     if name in ("upload_pdf", "upload_pdf_chunk"):
         return "upload"

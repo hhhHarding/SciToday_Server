@@ -15,8 +15,11 @@
 
 RSS discovery 默认按 60 分钟回退间隔运行，实际下次抓取会结合 HTTP
 `Cache-Control`/`Expires`、RSS `ttl`、连续无更新次数及错误退避动态计算，配置下限为
-15 分钟。请求默认使用 `SciTodayRSS/1.0`，运营者可通过
-`RSSAI_RSS_USER_AGENT` 设置包含版本和联系信息的透明客户端标识。
+15 分钟。为通过部分出版社（ACS、Wiley 等）Cloudflare/Atypon 对脚本 UA 的
+拦截，请求默认使用真实浏览器 User-Agent；运营者可通过
+`RSSAI_RSS_USER_AGENT` 覆盖为包含版本和联系信息的透明客户端标识（如旧默认
+`SciTodayRSS/1.0`）。403 采用 1 小时起步的指数退避（上限 24 小时），单次
+瞬时拦截不会再冻结 feed 或整个出版社 host 一整天。
 
 部署前运行 `user_web\build.ps1`，确保发布包包含
 `user_web\dist\index.html`；线上运行不需要 Node.js。

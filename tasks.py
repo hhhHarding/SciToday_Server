@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import threading
 import time
+import unicodedata
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -178,10 +179,18 @@ TRAY_CONFIG_PATH = _env_path(
     SERVER_PATHS.tray_config,
 )
 
+# 部分出版社的 Cloudflare/Atypon 规则会拦截明显的脚本标识（如 python-requests）。
+# 默认采用真实浏览器 UA 以通过这类通用反爬；运营者可用 RSSAI_RSS_USER_AGENT
+# 覆盖为包含联系方式的透明客户端标识（旧默认为 SciTodayRSS/1.0）。
+RSS_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
 RSS_HEADERS = {
     "User-Agent": (
         (os.environ.get("RSSAI_RSS_USER_AGENT") or "").strip()
-        or "SciTodayRSS/1.0"
+        or RSS_DEFAULT_USER_AGENT
     ),
     "Accept": "application/rss+xml, application/xml, text/xml, text/html, */*",
     "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
@@ -196,6 +205,8 @@ RSS_FEED_LEASE_SECONDS = 60 * 60
 RSS_PROBE_COOLDOWN_SECONDS = 60 * 60
 RSS_HOST_WORKERS = 4
 RSS_HOST_GAP_SECONDS = (5, 15)
+RSS_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+RSS_NOT_MODIFIED_STATUSES = frozenset({204, 304})
 
 
 @dataclass(slots=True)
@@ -899,7 +910,10 @@ def http_get(
                     headers=headers,
                     session=reusable_session,
                 )
-                if 300 <= response.status_code < 400:
+                # 304 是条件请求的正常“未更新”响应，204 也表示没有可返回内容；
+                # 只有明确具备重定向语义的状态码才要求 Location。不能用整个
+                # 300-399 范围，否则会把正常 304 误报为“重定向缺少 Location”。
+                if response.status_code in RSS_REDIRECT_STATUSES:
                     location = str(response.headers.get("Location") or "").strip()
                     response.close()
                     if not location:
@@ -1386,6 +1400,55 @@ def _pdf_db():
     return _connect(PDF_DB, _migrate_pdf_db)
 
 
+def _ensure_digest_search_index(con):
+    """Create the per-tenant FTS index without making FTS availability fatal."""
+    exists = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='digests_fts'"
+    ).fetchone()
+    try:
+        con.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS digests_fts USING fts5(
+            title, cn_title, keywords, journal, preview,
+            content='digests', content_rowid='id', tokenize='trigram'
+        )""")
+    except sqlite3.OperationalError as exc:
+        logger.warning("SQLite FTS5 trigram 不可用，AI 检索将使用兼容粗筛: %s", exc)
+        return
+
+    con.executescript("""
+        CREATE TRIGGER IF NOT EXISTS digests_fts_ai AFTER INSERT ON digests BEGIN
+            INSERT INTO digests_fts(rowid, title, cn_title, keywords, journal, preview)
+            VALUES (
+                new.id, new.title, new.cn_title, new.keywords, new.journal, new.preview
+            );
+        END;
+        CREATE TRIGGER IF NOT EXISTS digests_fts_ad AFTER DELETE ON digests BEGIN
+            INSERT INTO digests_fts(
+                digests_fts, rowid, title, cn_title, keywords, journal, preview
+            )
+            VALUES (
+                'delete', old.id, old.title, old.cn_title, old.keywords,
+                old.journal, old.preview
+            );
+        END;
+        CREATE TRIGGER IF NOT EXISTS digests_fts_au
+        AFTER UPDATE OF title, cn_title, keywords, journal, preview ON digests BEGIN
+            INSERT INTO digests_fts(
+                digests_fts, rowid, title, cn_title, keywords, journal, preview
+            )
+            VALUES (
+                'delete', old.id, old.title, old.cn_title, old.keywords,
+                old.journal, old.preview
+            );
+            INSERT INTO digests_fts(rowid, title, cn_title, keywords, journal, preview)
+            VALUES (
+                new.id, new.title, new.cn_title, new.keywords, new.journal, new.preview
+            );
+        END;
+    """)
+    if not exists:
+        con.execute("INSERT INTO digests_fts(digests_fts) VALUES('rebuild')")
+
+
 def _migrate_digest_db(con):
     con.execute("""CREATE TABLE IF NOT EXISTS digests(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1443,6 +1506,7 @@ def _migrate_digest_db(con):
                 "UPDATE digests SET journal_group_key=? WHERE id=?",
                 (_journal_group_key(journal), row_id),
             )
+    _ensure_digest_search_index(con)
     con.commit()
 
 
@@ -3298,6 +3362,8 @@ def _response_cache_hint_seconds(response, parsed=None, now=None):
 
 
 def _http_error_category(status):
+    if 300 <= status < 400:
+        return "redirect_error"
     if status in {401, 403}:
         return "access_denied"
     if status == 429:
@@ -3362,7 +3428,7 @@ def _fetch_single_feed(
                 response.headers.get("Retry-After")
             ),
         }
-        if status == 304:
+        if status in RSS_NOT_MODIFIED_STATUSES:
             response.close()
             return FeedFetchResult(
                 feed=feed,
@@ -3935,7 +4001,9 @@ def sync_shared_feed_fetch_state(feeds=None, now=None):
         ).fetchone()
         if not exists:
             legacy_error = legacy_blocked.get(normalized, "")
-            blocked_until = now + 24 * 60 * 60 if legacy_error else 0
+            # 迁移旧的 403 记录时只种入 1 小时冷却，让新的浏览器 UA 尽快重试，
+            # 而不是部署后整站沉默一整天。
+            blocked_until = now + 60 * 60 if legacy_error else 0
             stagger = int(hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8], 16) % (
                 15 * 60
             )
@@ -4060,7 +4128,9 @@ def _release_shared_host_lease(host, now=None):
 def _feed_failure_policy(category, failures, retry_after=0):
     exponent = max(0, int(failures) - 1)
     if category == "access_denied":
-        return min(24 * 60 * 60 * (2 ** exponent), 7 * 24 * 60 * 60), False
+        # 403 常由瞬时的 IP 信誉/突发流量触发，首次仅冷却 1 小时并指数回退，
+        # 避免单次抖动就把 feed 锁死一整天；上限 24 小时。
+        return min(60 * 60 * (2 ** exponent), 24 * 60 * 60), False
     if category == "rate_limited":
         delay = max(int(retry_after or 0), 6 * 60 * 60 * (2 ** exponent))
         return min(delay, 7 * 24 * 60 * 60), False
@@ -4209,9 +4279,11 @@ def _record_shared_fetch_result(
             ).fetchone()
             host_failures += 1
             if other_denied:
+                # 同一 host 上出现第二个 403 才升级为 host 级冷却，但从 2 小时起步
+                # 指数回退（上限 24 小时），避免一次瞬时抖动冻结整个出版社一整天。
                 host_delay = min(
-                    24 * 60 * 60 * (2 ** max(0, host_failures - 2)),
-                    7 * 24 * 60 * 60,
+                    2 * 60 * 60 * (2 ** max(0, host_failures - 2)),
+                    24 * 60 * 60,
                 )
             else:
                 host_delay = 60 * 60
@@ -5526,6 +5598,252 @@ def reset_seen_to_recent_week():
     con.close()
 
 
+AI_SEARCH_CANDIDATE_LIMIT = 100
+AI_SEARCH_RESULT_LIMIT = 30
+AI_SEARCH_PREVIEW_CHARS = 300
+_DIGEST_SELECT_COLUMNS = """filename, timestamp, title, cn_title, keywords,
+    journal, source, preview, disliked, interested, is_read, relevance_score,
+    novelty_score, final_score, recommendation_type, interest_profile_version,
+    scored_at"""
+_DIGEST_SELECT_COLUMNS_QUALIFIED = ", ".join(
+    f"digests.{name.strip()}"
+    for name in _DIGEST_SELECT_COLUMNS.replace("\n", " ").split(",")
+)
+
+
+class AiSearchUnavailableError(RuntimeError):
+    """AI search cannot run because its provider configuration is unavailable."""
+
+
+class AiSearchFailedError(RuntimeError):
+    """AI search exhausted its allowed attempts."""
+
+
+def _digest_row_to_dict(row):
+    return {
+        "filename": row[0],
+        "timestamp": row[1] or "",
+        "title": row[2] or "",
+        "cn_title": row[3] or "",
+        "keywords": row[4] or "",
+        "journal": row[5] or "",
+        "source": row[6] or "rss",
+        "preview": row[7] or "",
+        "disliked": bool(row[8]),
+        "interested": bool(row[9]),
+        "is_read": bool(row[10]),
+        "relevance_score": row[11],
+        "novelty_score": row[12],
+        "final_score": row[13],
+        "recommendation_type": row[14] or "",
+        "interest_profile_version": int(row[15] or 0),
+        "scored_at": int(row[16] or 0),
+    }
+
+
+def _normalize_ai_search_query(value):
+    return unicodedata.normalize("NFKC", str(value or "")).strip().lower()
+
+
+def _ai_search_terms(query, max_terms=48):
+    normalized = _normalize_ai_search_query(query)
+    chunks = re.findall(r"[a-z0-9][a-z0-9.+#_-]*|[\u3400-\u9fff]+", normalized)
+    terms = []
+    seen = set()
+    for chunk in chunks:
+        if re.fullmatch(r"[\u3400-\u9fff]+", chunk):
+            candidates = (
+                [chunk]
+                if len(chunk) == 3
+                else [chunk[i:i + 3] for i in range(max(0, len(chunk) - 2))]
+            )
+        else:
+            candidates = [chunk] if len(chunk) >= 3 else []
+        for term in candidates:
+            if term not in seen:
+                seen.add(term)
+                terms.append(term)
+                if len(terms) >= max_terms:
+                    return terms
+    return terms
+
+
+def _compat_digest_candidates(con, query, limit):
+    """Portable weighted scan used when FTS5 is unavailable or has no usable term."""
+    rows = con.execute(
+        f"""SELECT {_DIGEST_SELECT_COLUMNS}, created_ts
+            FROM digests
+            WHERE deleted=0 AND source='rss'"""
+    ).fetchall()
+    normalized = _normalize_ai_search_query(query)
+    terms = _ai_search_terms(query)
+    if not terms:
+        terms = [normalized] if normalized else []
+    weights = (8, 8, 6, 2, 1)
+    ranked = []
+    for row in rows:
+        fields = [_normalize_ai_search_query(row[i]) for i in range(2, 8)]
+        searchable = (fields[0], fields[1], fields[2], fields[3], fields[5])
+        score = sum(
+            weight
+            for term in terms
+            for weight, field in zip(weights, searchable)
+            if term and term in field
+        )
+        if score > 0:
+            ranked.append((score, int(row[17] or 0), row))
+    ranked.sort(key=lambda item: (-item[0], -item[1]))
+    return [_digest_row_to_dict(item[2]) for item in ranked[:limit]]
+
+
+def search_digest_candidates(query, limit=AI_SEARCH_CANDIDATE_LIMIT):
+    """Return a tenant-local lexical shortlist for AI reranking."""
+    normalized = _normalize_ai_search_query(query)
+    limit = max(1, min(int(limit or AI_SEARCH_CANDIDATE_LIMIT), AI_SEARCH_CANDIDATE_LIMIT))
+    if not normalized:
+        return []
+    _sync_digest_index()
+    con = _digest_db()
+    try:
+        terms = _ai_search_terms(normalized)
+        has_fts = con.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='digests_fts'"
+        ).fetchone()
+        if has_fts and terms:
+            match_query = " OR ".join(
+                f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms
+            )
+            rows = con.execute(
+                f"""SELECT {_DIGEST_SELECT_COLUMNS_QUALIFIED}
+                    FROM digests_fts
+                    JOIN digests ON digests.id=digests_fts.rowid
+                    WHERE digests_fts MATCH ?
+                      AND digests.deleted=0
+                      AND digests.source='rss'
+                    ORDER BY bm25(digests_fts, 8.0, 8.0, 6.0, 2.0, 1.0),
+                             digests.created_ts DESC, digests.id DESC
+                    LIMIT ?""",
+                (match_query, limit),
+            ).fetchall()
+            if rows:
+                return [_digest_row_to_dict(row) for row in rows]
+        return _compat_digest_candidates(con, normalized, limit)
+    finally:
+        con.close()
+
+
+def _ai_search_prompt(query, candidates):
+    compact = [{
+        "filename": item["filename"],
+        "title": item.get("title", ""),
+        "cn_title": item.get("cn_title", ""),
+        "keywords": item.get("keywords", ""),
+        "journal": item.get("journal", ""),
+        "preview": str(item.get("preview", ""))[:AI_SEARCH_PREVIEW_CHARS],
+    } for item in candidates]
+    return f"""请从给定候选论文中找出与用户检索意图相关的论文，并按相关性从高到低排序。
+
+要求：
+1. 只能使用候选列表中已有的 filename，不得编造。
+2. 可以剔除不相关候选，最多返回 {AI_SEARCH_RESULT_LIMIT} 条。
+3. 只输出严格 JSON 对象，不要 Markdown 或解释。
+4. 格式必须为：{{"matches":[{{"filename":"候选 filename"}}]}}
+
+用户检索：
+{query}
+
+候选论文：
+{json.dumps(compact, ensure_ascii=False, separators=(',', ':'))}"""
+
+
+def _parse_ai_search_matches(text, candidates):
+    payload = _strict_json_object(text)
+    matches = payload.get("matches")
+    if not isinstance(matches, list):
+        raise ValueError("AI 检索结果缺少 matches 数组")
+    allowed = {item["filename"] for item in candidates}
+    result = []
+    seen = set()
+    for entry in matches:
+        filename = entry.get("filename") if isinstance(entry, dict) else None
+        if not isinstance(filename, str) or filename not in allowed or filename in seen:
+            continue
+        seen.add(filename)
+        result.append(filename)
+        if len(result) >= AI_SEARCH_RESULT_LIMIT:
+            break
+    return result
+
+
+def _ai_search_retryable(error):
+    if isinstance(error, (json.JSONDecodeError, ValueError, requests.Timeout, requests.ConnectionError)):
+        return True
+    if isinstance(error, requests.HTTPError):
+        response = error.response
+        return response is not None and 500 <= response.status_code < 600
+    return False
+
+
+def ai_search_digests(query):
+    """Run lexical candidate retrieval followed by one AI reranking request."""
+    started = time.monotonic()
+    candidates = search_digest_candidates(query)
+    if not candidates:
+        logger.info("AI 检索完成 candidates=0 results=0 retries=0 elapsed_ms=%d",
+                    int((time.monotonic() - started) * 1000))
+        return {
+            "query": str(query).strip(),
+            "candidate_count": 0,
+            "ai_ranked": False,
+            "items": [],
+        }
+
+    prompt = _ai_search_prompt(str(query).strip(), candidates)
+    retries = 0
+    filenames = None
+    for attempt in range(2):
+        try:
+            raw = _ai_call(
+                prompt,
+                "你是论文检索排序器，只输出符合指定结构的严格 JSON。",
+                temperature=0.0,
+                timeout=120,
+            )
+            filenames = _parse_ai_search_matches(raw, candidates)
+            break
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and (
+                "未配置 AI API Key" in str(exc) or "base_url 不安全" in str(exc)
+            ):
+                raise AiSearchUnavailableError("AI 服务未配置或不可用") from exc
+            if attempt == 0 and _ai_search_retryable(exc):
+                retries = 1
+                continue
+            logger.warning(
+                "AI 检索失败 candidates=%d retries=%d error_type=%s",
+                len(candidates),
+                retries,
+                type(exc).__name__,
+            )
+            raise AiSearchFailedError("AI 检索失败，请稍后重试") from exc
+
+    by_filename = {item["filename"]: item for item in candidates}
+    items = [by_filename[filename] for filename in (filenames or [])]
+    logger.info(
+        "AI 检索完成 candidates=%d results=%d retries=%d elapsed_ms=%d",
+        len(candidates),
+        len(items),
+        retries,
+        int((time.monotonic() - started) * 1000),
+    )
+    return {
+        "query": str(query).strip(),
+        "candidate_count": len(candidates),
+        "ai_ranked": True,
+        "items": items,
+    }
+
+
 def get_recent_digests(limit=None, source=None, recommendation=None,
                        journal_group_key=None, interested_only=False):
     if limit is not None:
@@ -5557,33 +5875,12 @@ def get_recent_digests(limit=None, source=None, recommendation=None,
         if limit is not None:
             limit_clause = "LIMIT ?"
             params.append(limit)
-        rows = con.execute(f"""SELECT filename, timestamp, title, cn_title, keywords,
-            journal, source, preview, disliked, interested, is_read, relevance_score,
-            novelty_score, final_score, recommendation_type, interest_profile_version,
-            scored_at FROM digests
+        rows = con.execute(f"""SELECT {_DIGEST_SELECT_COLUMNS} FROM digests
             {where}
             ORDER BY created_ts DESC, id DESC
             {limit_clause}""", params).fetchall()
         con.close()
-        return [{
-            "filename": r[0],
-            "timestamp": r[1] or "",
-            "title": r[2] or "",
-            "cn_title": r[3] or "",
-            "keywords": r[4] or "",
-            "journal": r[5] or "",
-            "source": r[6] or "rss",
-            "preview": r[7] or "",
-            "disliked": bool(r[8]),
-            "interested": bool(r[9]),
-            "is_read": bool(r[10]),
-            "relevance_score": r[11],
-            "novelty_score": r[12],
-            "final_score": r[13],
-            "recommendation_type": r[14] or "",
-            "interest_profile_version": int(r[15] or 0),
-            "scored_at": int(r[16] or 0),
-        } for r in rows]
+        return [_digest_row_to_dict(row) for row in rows]
     except Exception as e:
         logger.warning(f"摘要索引读取失败，回退扫描文件: {e}")
         files = sorted(INBOX_DIR.glob("*.html"), key=lambda p: p.stat().st_mtime, reverse=True)

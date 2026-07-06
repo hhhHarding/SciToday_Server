@@ -1535,6 +1535,28 @@ def api_digests():
     ))
 
 
+@app.route("/api/digests/ai-search", methods=["POST"])
+def api_ai_search_digests():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "请求体必须是 JSON 对象", "code": "invalid_request"}), 400
+    query = data.get("query")
+    if not isinstance(query, str):
+        return jsonify({"error": "query 必须是字符串", "code": "invalid_query"}), 400
+    query = query.strip()
+    if not query or len(query) > 200:
+        return jsonify({
+            "error": "query 长度必须为 1-200 个字符",
+            "code": "invalid_query",
+        }), 400
+    try:
+        return jsonify(tasks.ai_search_digests(query))
+    except tasks.AiSearchUnavailableError as exc:
+        return jsonify({"error": str(exc), "code": "ai_unavailable"}), 503
+    except tasks.AiSearchFailedError as exc:
+        return jsonify({"error": str(exc), "code": "ai_search_failed"}), 502
+
+
 @app.route("/api/digests/stats")
 def api_digest_stats():
     source = request.args.get("source") or None

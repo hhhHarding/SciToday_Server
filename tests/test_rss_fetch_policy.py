@@ -91,7 +91,10 @@ class RssFetchPolicyTests(unittest.TestCase):
         headers = get.call_args.kwargs["headers"]
         self.assertEqual(headers["If-None-Match"], '"abc"')
         self.assertEqual(headers["If-Modified-Since"], "yesterday")
-        self.assertEqual(tasks.RSS_HEADERS["User-Agent"], "SciTodayRSS/1.0")
+        self.assertEqual(
+            tasks.RSS_HEADERS["User-Agent"], tasks.RSS_DEFAULT_USER_AGENT
+        )
+        self.assertIn("Mozilla/5.0", tasks.RSS_HEADERS["User-Agent"])
         self.assertNotIn("Connection", tasks.RSS_HEADERS)
 
     def test_http_403_is_not_retried(self):
@@ -123,7 +126,7 @@ class RssFetchPolicyTests(unittest.TestCase):
             )
             tasks._record_shared_fetch_result(first, now=1000)
             row = self._state_row(FEED_A)
-            self.assertEqual(row["blocked_until_ts"], 1000 + 24 * 60 * 60)
+            self.assertEqual(row["blocked_until_ts"], 1000 + 60 * 60)
             self.assertEqual(row["consecutive_failures"], 1)
 
             second = tasks.FeedFetchResult(
@@ -138,7 +141,7 @@ class RssFetchPolicyTests(unittest.TestCase):
                 "SELECT blocked_until_ts FROM host_fetch_state WHERE host='feeds.example'"
             ).fetchone()
             con.close()
-            self.assertGreaterEqual(host[0], 5000 + 24 * 60 * 60)
+            self.assertEqual(host[0], 5000 + 2 * 60 * 60)
 
     def test_failure_categories_have_distinct_retry_and_disable_policies(self):
         delay, disabled = tasks._feed_failure_policy(
@@ -207,7 +210,7 @@ class RssFetchPolicyTests(unittest.TestCase):
                 self.assertEqual(row["next_fetch_ts"], 2000 + 30 * 60)
                 self.assertEqual(row["etag"], '"new"')
 
-    def test_legacy_403_is_seeded_with_24_hour_cooldown(self):
+    def test_legacy_403_is_seeded_with_one_hour_cooldown(self):
         with tenant_context("owner"):
             tasks.record_feed_health(
                 {"title": "A", "url": FEED_A},
@@ -217,7 +220,7 @@ class RssFetchPolicyTests(unittest.TestCase):
             tasks.sync_shared_feed_fetch_state({FEED_A: "A"}, now=1000)
             row = self._state_row()
             self.assertEqual(row["error_category"], "access_denied")
-            self.assertEqual(row["blocked_until_ts"], 1000 + 24 * 60 * 60)
+            self.assertEqual(row["blocked_until_ts"], 1000 + 60 * 60)
 
     def test_host_worker_stops_after_access_denied(self):
         states = [
