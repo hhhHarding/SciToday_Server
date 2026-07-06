@@ -25,7 +25,7 @@ class _FakeEntry:
         self.published_parsed = None
 
 
-def _feed_entries(feed, per_feed_limit, since_ts=0):
+def _feed_entries(feed, per_feed_limit, since_ts=0, *args, **kwargs):
     """Patched _fetch_single_feed: return two synthetic entries per feed."""
     entries = [
         _FakeEntry(f"{feed['title']}-article-1", f"{feed['url']}/1"),
@@ -95,6 +95,15 @@ class SharedCachePipelineTests(unittest.TestCase):
         def fake_ai_call(prompt, system_prompt=None, temperature=0.1, timeout=120):
             keys_used.append(tasks._ai_config()[0])
             return "中文题目：测试\n中文关键词：甲、乙\n正文内容。"
+
+        with tenant_context("owner"):
+            feeds = tasks._active_tenant_feed_union()
+            tasks.sync_shared_feed_fetch_state(feeds)
+            con = tasks._shared_content_db()
+            con.execute("UPDATE feed_fetch_state SET next_fetch_ts=0, blocked_until_ts=0")
+            con.execute("UPDATE host_fetch_state SET next_allowed_ts=0, blocked_until_ts=0")
+            con.commit()
+            con.close()
 
         with patch.object(tasks, "_fetch_single_feed", side_effect=_feed_entries), \
                 patch.object(tasks, "_ai_call", side_effect=fake_ai_call):

@@ -102,6 +102,7 @@ def category_for_endpoint(endpoint: str | None) -> str:
         "run_pdf",
         "run_rss_discovery",
         "run_rss_publish",
+        "api_admin_rss_probe",
     ):
         return "task"
     return "default"

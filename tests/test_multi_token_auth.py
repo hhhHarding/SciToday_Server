@@ -82,6 +82,49 @@ class MultiTokenAuthTests(unittest.TestCase):
     def _headers(token):
         return {"Authorization": f"Bearer {token}"}
 
+    def test_heartbeat_only_submits_tenant_delivery(self):
+        with patch.object(tasks, "record_app_heartbeat", return_value={}), patch.object(
+            self.coordinator, "submit"
+        ) as submit:
+            for _ in range(3):
+                response = self.client.post(
+                    "/api/app/heartbeat",
+                    headers=self._headers(self.alpha.token),
+                    json={"reason": "periodic"},
+                )
+                self.assertEqual(response.status_code, 200)
+        self.assertEqual(submit.call_count, 3)
+        self.assertTrue(
+            all(
+                call.args[:2] == ("t_alpha", "rss_deliver")
+                and call.kwargs["trigger_source"] == "heartbeat"
+                for call in submit.call_args_list
+            )
+        )
+
+    def test_rss_probe_is_operator_only(self):
+        tenant_response = self.client.post(
+            "/api/admin/rss-probe",
+            headers=self._headers(self.alpha.token),
+            json={"url": "https://feeds.example/a.xml", "override_cooldown": True},
+        )
+        self.assertEqual(tenant_response.status_code, 403)
+        with patch.object(
+            tasks,
+            "probe_shared_rss_feed",
+            return_value={"ok": True, "status_code": 200},
+        ) as probe:
+            operator_response = self.client.post(
+                "/api/admin/rss-probe",
+                headers=self._headers("operator-test-token"),
+                json={"url": "https://feeds.example/a.xml", "override_cooldown": True},
+            )
+        self.assertEqual(operator_response.status_code, 200)
+        probe.assert_called_once_with(
+            "https://feeds.example/a.xml",
+            override_cooldown=True,
+        )
+
     def test_public_whitelist_and_default_deny(self):
         self.assertEqual(self.client.get("/").status_code, 200)
         self.assertEqual(self.client.get("/healthz").status_code, 200)

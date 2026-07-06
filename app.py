@@ -106,6 +106,8 @@ OPERATOR_ENDPOINTS = frozenset(
         "api_admin_tenant_tokens",
         "api_admin_tenant_token_revoke",
         "api_admin_metrics",
+        "api_admin_feed_health",
+        "api_admin_rss_probe",
     }
 )
 # 破坏性/写配置类租户接口：需要 tenant_admin scope。
@@ -175,21 +177,30 @@ def _wake_scheduler():
 
 
 def _trigger_connect_pipeline(tenant_id):
-    """租户接入即推送：先从共享暂存投递给本租户，再触发 owner 抓取/消化新内容。
-
-    两个任务都提交给协调器，其内建的 (tenant, job_type) 去重与有界队列会天然
-    合并重复请求、限制并发，因此高频心跳不会堆积重复消化。owner 消化用 owner Key。
-    """
+    """Heartbeat only updates tenant-local delivery; it never polls publishers."""
     coordinator = _task_coordinator()
     if coordinator is None:
         return
     try:
         coordinator.submit(tenant_id, "rss_deliver", trigger_source="heartbeat")
-        coordinator.submit(
-            OWNER_TENANT_ID, "shared_ingest", trigger_source="heartbeat"
-        )
     except Exception:
-        logger.exception("心跳触发投递/消化失败")
+        logger.exception("心跳触发投递失败")
+
+
+def _trigger_feed_union_refresh():
+    """Synchronize shared feed state after an OPML mutation."""
+    coordinator = _task_coordinator()
+    if coordinator is None:
+        return
+    try:
+        coordinator.submit(
+            OWNER_TENANT_ID,
+            "shared_ingest",
+            trigger_source="feed_change",
+        )
+        coordinator.wake_scheduler()
+    except Exception:
+        logger.exception("订阅源变更后触发共享状态同步失败")
 
 
 def _provided_bearer_token():
@@ -614,7 +625,7 @@ _CONFIG_INT_LIMITS = {
     "per_feed_limit": (1, 100),
     "max_push_items": (1, 500),
     "lookback_days": (1, 365),
-    "rss_discovery_interval_minutes": (1, 1440),
+    "rss_discovery_interval_minutes": (15, 1440),
     "rss_interval_minutes": (1, 1440),
     "pdf_interval_minutes": (1, 1440),
 }
@@ -1000,6 +1011,7 @@ def add_feed():
     cfg = tasks.load_config()
     opml = tasks.get_opml_path(cfg)
     tasks.add_feed_to_opml(opml, title, url)
+    _trigger_feed_union_refresh()
     return jsonify({"ok": True})
 
 
@@ -1008,6 +1020,7 @@ def delete_feed(url):
     cfg = tasks.load_config()
     opml = tasks.get_opml_path(cfg)
     tasks.remove_feed_from_opml(opml, url)
+    _trigger_feed_union_refresh()
     return jsonify({"ok": True})
 
 
@@ -1024,6 +1037,7 @@ def delete_feed_query():
     cfg = tasks.load_config()
     opml = tasks.get_opml_path(cfg)
     tasks.remove_feed_from_opml(opml, url)
+    _trigger_feed_union_refresh()
     return jsonify({"ok": True})
 
 
@@ -1035,6 +1049,7 @@ def import_opml():
     cfg = tasks.load_config()
     opml = tasks.get_opml_path(cfg)
     f.save(opml)
+    _trigger_feed_union_refresh()
     return jsonify({"ok": True, "count": len(tasks.parse_opml(opml))})
 
 
@@ -1232,6 +1247,23 @@ def api_admin_events():
 @app.route("/api/admin/feed-health")
 def api_admin_feed_health():
     return jsonify(tasks.get_feed_health())
+
+
+@app.route("/api/admin/rss-probe", methods=["POST"])
+def api_admin_rss_probe():
+    data = request.get_json(silent=True) or {}
+    url = str(data.get("url") or "").strip()
+    override = data.get("override_cooldown", False)
+    if not url:
+        return jsonify({"error": "缺少 url"}), 400
+    if not isinstance(override, bool):
+        return jsonify({"error": "override_cooldown 必须是布尔值"}), 400
+    result = tasks.probe_shared_rss_feed(url, override_cooldown=override)
+    status_code = int(result.pop("status_code", 200))
+    response = jsonify(result)
+    if result.get("retry_after"):
+        response.headers["Retry-After"] = str(max(1, int(result["retry_after"])))
+    return response, status_code
 
 
 @app.route("/api/admin/rss-queue")
@@ -1491,13 +1523,28 @@ def api_digests():
     recommendation = (request.args.get("recommendation") or "").strip().lower() or None
     if recommendation not in {None, "any", "ai", "explore"}:
         return jsonify({"error": "recommendation 必须是 any、ai 或 explore"}), 400
-    return jsonify(tasks.get_recent_digests(n, source=source, recommendation=recommendation))
+    # 分组模式展开某期刊时按分组键过滤；journal_group_key 显式传入（含空串="未标注期刊"）才生效。
+    group_key = request.args.get("journal_group_key")
+    interested_only = request.args.get("interested_only") in ("1", "true", "True")
+    return jsonify(tasks.get_recent_digests(
+        n,
+        source=source,
+        recommendation=recommendation,
+        journal_group_key=group_key,
+        interested_only=interested_only,
+    ))
 
 
 @app.route("/api/digests/stats")
 def api_digest_stats():
     source = request.args.get("source") or None
     return jsonify(tasks.get_digest_stats(source=source))
+
+
+@app.route("/api/digests/journal-stats")
+def api_journal_stats():
+    source = request.args.get("source") or None
+    return jsonify(tasks.get_journal_stats(source=source))
 
 
 @app.route("/api/digests/updates")

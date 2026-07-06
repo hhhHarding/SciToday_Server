@@ -13,5 +13,10 @@
 从 `config.example.json` 创建本地 `config.json`。不要提交真实配置、数据库、
 日志、OPML、PDF 或 inbox 内容。
 
+RSS discovery 默认按 60 分钟回退间隔运行，实际下次抓取会结合 HTTP
+`Cache-Control`/`Expires`、RSS `ttl`、连续无更新次数及错误退避动态计算，配置下限为
+15 分钟。请求默认使用 `SciTodayRSS/1.0`，运营者可通过
+`RSSAI_RSS_USER_AGENT` 设置包含版本和联系信息的透明客户端标识。
+
 部署前运行 `user_web\build.ps1`，确保发布包包含
 `user_web\dist\index.html`；线上运行不需要 Node.js。

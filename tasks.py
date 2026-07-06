@@ -6,6 +6,7 @@ import html as html_mod
 import json
 import logging
 import os
+import random
 import re
 import socket
 import sqlite3
@@ -14,6 +15,7 @@ import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
@@ -178,14 +180,50 @@ TRAY_CONFIG_PATH = _env_path(
 
 RSS_HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Linux; Android 16; Mobile) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0 Mobile Safari/537.36"
+        (os.environ.get("RSSAI_RSS_USER_AGENT") or "").strip()
+        or "SciTodayRSS/1.0"
     ),
     "Accept": "application/rss+xml, application/xml, text/xml, text/html, */*",
     "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
-    "Connection": "close",
+    "Accept-Encoding": "gzip, deflate",
 }
+
+RSS_MIN_INTERVAL_SECONDS = 15 * 60
+RSS_DEFAULT_INTERVAL_SECONDS = 60 * 60
+RSS_UNCHANGED_MAX_INTERVAL_SECONDS = 6 * 60 * 60
+RSS_MAX_INTERVAL_SECONDS = 24 * 60 * 60
+RSS_FEED_LEASE_SECONDS = 60 * 60
+RSS_PROBE_COOLDOWN_SECONDS = 60 * 60
+RSS_HOST_WORKERS = 4
+RSS_HOST_GAP_SECONDS = (5, 15)
+
+
+@dataclass(slots=True)
+class FeedFetchResult:
+    feed: dict
+    entries: list = field(default_factory=list)
+    category: str = "ok"
+    error: str = ""
+    duration_ms: int = 0
+    skipped_old: int = 0
+    http_status: int = 0
+    etag: str = ""
+    last_modified: str = ""
+    final_url: str = ""
+    cache_hint_seconds: int = 0
+    retry_after_seconds: int = 0
+
+    @property
+    def ok(self):
+        return self.category in {"ok", "not_modified"}
+
+    def __iter__(self):
+        """Keep legacy tuple-unpacking callers and tests compatible."""
+        yield self.feed
+        yield self.entries
+        yield None if self.ok else self.error
+        yield self.duration_ms
+        yield self.skipped_old
 
 DEFAULT_PREFERENCE_WEIGHTS = {
     "pdf_matched": 100,
@@ -744,7 +782,7 @@ def _original_host_header(url):
     return f"{host}:{parsed.port}" if parsed.port is not None else host
 
 
-def _request_pinned_feed_url(url, addresses, timeout):
+def _request_pinned_feed_url(url, addresses, timeout, headers=None, session=None):
     """GET one URL using only the validated addresses; automatic redirects stay off."""
 
     parsed = urlsplit(url)
@@ -752,11 +790,11 @@ def _request_pinned_feed_url(url, addresses, timeout):
     host_header = _original_host_header(url)
     last_error = None
     for address in addresses:
-        session = _make_pinned_feed_session(hostname)
+        request_session = session or _make_pinned_feed_session(hostname)
         try:
-            response = session.get(
+            response = request_session.get(
                 _url_with_pinned_address(url, address),
-                headers={**RSS_HEADERS, "Host": host_header},
+                headers={**RSS_HEADERS, **(headers or {}), "Host": host_header},
                 timeout=timeout,
                 allow_redirects=False,
             )
@@ -766,7 +804,8 @@ def _request_pinned_feed_url(url, addresses, timeout):
         except requests.RequestException as exc:
             last_error = exc
         finally:
-            session.close()
+            if session is None:
+                request_session.close()
     if last_error is not None:
         raise last_error
     raise UnsafeOutboundURLError("URL 没有可用公网地址")
@@ -809,10 +848,34 @@ SEARCH_SESSION = _make_search_session()
 SEARCH_TIMEOUT = (4, 10)
 
 
-def http_get(url, timeout=35, max_attempts=3, max_redirects=5, resolver=None):
+def _retry_after_seconds(value, now=None):
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    try:
+        return max(0, int(text))
+    except ValueError:
+        pass
+    try:
+        parsed = parsedate_to_datetime(text)
+        return max(0, int(parsed.timestamp() - (time.time() if now is None else now)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def http_get(
+    url,
+    timeout=35,
+    max_attempts=2,
+    max_redirects=5,
+    resolver=None,
+    headers=None,
+    session=None,
+):
     """安全抓取 RSS：固定已验证 IP，并对每一跳重定向重新做 SSRF 校验。"""
 
     current_url = _normalize_feed_url(url)
+    session_host = (urlsplit(current_url).hostname or "").lower()
     visited = set()
     redirect_count = 0
     while True:
@@ -827,7 +890,15 @@ def http_get(url, timeout=35, max_attempts=3, max_redirects=5, resolver=None):
                     current_url,
                     resolver=resolver,
                 )
-                response = _request_pinned_feed_url(safe_url, addresses, timeout)
+                current_host = (urlsplit(safe_url).hostname or "").lower()
+                reusable_session = session if current_host == session_host else None
+                response = _request_pinned_feed_url(
+                    safe_url,
+                    addresses,
+                    timeout,
+                    headers=headers,
+                    session=reusable_session,
+                )
                 if 300 <= response.status_code < 400:
                     location = str(response.headers.get("Location") or "").strip()
                     response.close()
@@ -836,12 +907,23 @@ def http_get(url, timeout=35, max_attempts=3, max_redirects=5, resolver=None):
                     redirect_target = urljoin(safe_url, location)
                     # 在下一次发出网络请求前，循环顶部会对新目标重新解析并校验。
                     break
-                response.raise_for_status()
+                # 4xx 必须交给上层分类，不能在这里无差别重试。408/5xx 仅在服务端
+                # 没有给 Retry-After 时做一次短暂的传输级重试。
+                if (
+                    (response.status_code == 408 or response.status_code >= 500)
+                    and attempt < max_attempts
+                    and not _retry_after_seconds(response.headers.get("Retry-After"))
+                ):
+                    response.close()
+                    time.sleep(random.uniform(1, 3))
+                    continue
                 return response
             except UnsafeOutboundURLError:
                 # 安全策略拒绝不属于临时网络故障，不能通过重试掩盖或放行。
                 raise
-            except Exception as exc:
+            except (requests.exceptions.SSLError, requests.TooManyRedirects):
+                raise
+            except (requests.Timeout, requests.ConnectionError) as exc:
                 last = exc
                 safe_log_url = redact_sensitive_text(current_url)
                 logger.warning(
@@ -852,7 +934,15 @@ def http_get(url, timeout=35, max_attempts=3, max_redirects=5, resolver=None):
                     redact_sensitive_text(str(exc)),
                 )
                 if attempt < max_attempts:
-                    time.sleep(2 * attempt)
+                    time.sleep(random.uniform(1, 3))
+            except Exception as exc:
+                last = exc
+                logger.warning(
+                    "抓取失败: %s | %s",
+                    redact_sensitive_text(current_url),
+                    redact_sensitive_text(str(exc)),
+                )
+                break
         if redirect_target is None:
             raise last
         redirect_count += 1
@@ -1334,6 +1424,25 @@ def _migrate_digest_db(con):
     ):
         if name not in cols:
             con.execute(f"ALTER TABLE digests ADD COLUMN {name} {ddl}")
+    # 期刊分组键：折叠时后端按此列 GROUP BY 出各期刊篇数，与客户端分组口径一致。
+    needs_backfill = "journal_group_key" not in cols
+    if needs_backfill:
+        con.execute(
+            "ALTER TABLE digests ADD COLUMN journal_group_key TEXT NOT NULL DEFAULT ''"
+        )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_digests_group "
+        "ON digests(source, journal_group_key, deleted)"
+    )
+    if needs_backfill:
+        rows = con.execute(
+            "SELECT id, journal FROM digests WHERE journal_group_key=''"
+        ).fetchall()
+        for row_id, journal in rows:
+            con.execute(
+                "UPDATE digests SET journal_group_key=? WHERE id=?",
+                (_journal_group_key(journal), row_id),
+            )
     con.commit()
 
 
@@ -1514,6 +1623,55 @@ def _migrate_shared_content_db(con):
         digest_filename TEXT,
         delivered_ts INTEGER NOT NULL,
         PRIMARY KEY(tenant_id, item_key))""")
+    con.execute("""CREATE TABLE IF NOT EXISTS feed_fetch_state(
+        feed_url TEXT PRIMARY KEY,
+        host TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '',
+        etag TEXT NOT NULL DEFAULT '',
+        last_modified TEXT NOT NULL DEFAULT '',
+        resolved_url TEXT NOT NULL DEFAULT '',
+        last_checked_ts INTEGER NOT NULL DEFAULT 0,
+        last_success_ts INTEGER NOT NULL DEFAULT 0,
+        last_http_status INTEGER NOT NULL DEFAULT 0,
+        error_category TEXT NOT NULL DEFAULT '',
+        error TEXT NOT NULL DEFAULT '',
+        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+        unchanged_count INTEGER NOT NULL DEFAULT 0,
+        effective_interval_seconds INTEGER NOT NULL DEFAULT 3600,
+        next_fetch_ts INTEGER NOT NULL DEFAULT 0,
+        blocked_until_ts INTEGER NOT NULL DEFAULT 0,
+        lease_until_ts INTEGER NOT NULL DEFAULT 0,
+        disabled INTEGER NOT NULL DEFAULT 0,
+        disabled_reason TEXT NOT NULL DEFAULT '',
+        active INTEGER NOT NULL DEFAULT 1,
+        updated_ts INTEGER NOT NULL DEFAULT 0
+    )""")
+    feed_state_columns = {
+        row[1] for row in con.execute("PRAGMA table_info(feed_fetch_state)")
+    }
+    if "active" not in feed_state_columns:
+        con.execute(
+            "ALTER TABLE feed_fetch_state ADD COLUMN active INTEGER NOT NULL DEFAULT 1"
+        )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_feed_fetch_due "
+        "ON feed_fetch_state(disabled, next_fetch_ts, blocked_until_ts)"
+    )
+    con.execute(
+        "CREATE INDEX IF NOT EXISTS idx_feed_fetch_host "
+        "ON feed_fetch_state(host, last_checked_ts)"
+    )
+    con.execute("""CREATE TABLE IF NOT EXISTS host_fetch_state(
+        host TEXT PRIMARY KEY,
+        next_allowed_ts INTEGER NOT NULL DEFAULT 0,
+        blocked_until_ts INTEGER NOT NULL DEFAULT 0,
+        access_failure_count INTEGER NOT NULL DEFAULT 0,
+        last_http_status INTEGER NOT NULL DEFAULT 0,
+        last_error_ts INTEGER NOT NULL DEFAULT 0,
+        last_probe_ts INTEGER NOT NULL DEFAULT 0,
+        lease_until_ts INTEGER NOT NULL DEFAULT 0,
+        updated_ts INTEGER NOT NULL DEFAULT 0
+    )""")
     con.commit()
 
 
@@ -1675,12 +1833,81 @@ def record_feed_health(feed, ok, count=0, error="", duration_ms=0):
 
 
 def get_feed_health():
+    shared = _shared_content_db()
+    rows = shared.execute(
+        """SELECT feed.title, feed.feed_url, feed.host, feed.last_success_ts,
+            feed.last_checked_ts, feed.last_http_status, feed.error_category,
+            feed.error, feed.consecutive_failures, feed.next_fetch_ts,
+            feed.blocked_until_ts, feed.disabled, feed.disabled_reason,
+            host.last_probe_ts, host.blocked_until_ts
+        FROM feed_fetch_state AS feed
+        JOIN host_fetch_state AS host ON host.host=feed.host
+        WHERE feed.active=1
+        ORDER BY feed.title COLLATE NOCASE"""
+    ).fetchall()
+    shared.close()
+    if rows:
+        now = int(time.time())
+        result = []
+        for row in rows:
+            last_ok = int(row[3] or 0)
+            last_checked = int(row[4] or 0)
+            blocked_until = max(int(row[10] or 0), int(row[14] or 0))
+            disabled = bool(row[11])
+            if disabled:
+                status = "disabled"
+            elif blocked_until > now:
+                status = "blocked"
+            elif row[6] in {"", "ok", "not_modified"}:
+                status = "ok"
+            else:
+                status = "error"
+            last_probe = int(row[13] or 0)
+            probe_allowed_at = (
+                last_probe + RSS_PROBE_COOLDOWN_SECONDS if last_probe else 0
+            )
+            result.append({
+                "title": row[0] or "",
+                "url": row[1] or "",
+                "host": row[2] or "",
+                "status": status,
+                "last_ok_ts": last_ok,
+                "last_ok": (
+                    datetime.fromtimestamp(last_ok).strftime("%Y-%m-%d %H:%M:%S")
+                    if last_ok else ""
+                ),
+                "last_checked_ts": last_checked,
+                "last_checked": (
+                    datetime.fromtimestamp(last_checked).strftime("%Y-%m-%d %H:%M:%S")
+                    if last_checked else ""
+                ),
+                "http_status": int(row[5] or 0),
+                "error_category": row[6] or "",
+                "error": row[7] or "",
+                "consecutive_failures": int(row[8] or 0),
+                "next_fetch_ts": int(row[9] or 0),
+                "next_fetch": (
+                    datetime.fromtimestamp(row[9]).strftime("%Y-%m-%d %H:%M:%S")
+                    if row[9] else ""
+                ),
+                "blocked_until_ts": blocked_until,
+                "blocked_until": (
+                    datetime.fromtimestamp(blocked_until).strftime("%Y-%m-%d %H:%M:%S")
+                    if blocked_until else ""
+                ),
+                "disabled": disabled,
+                "disabled_reason": row[12] or "",
+                "probe_allowed_at": probe_allowed_at,
+                "probe_allowed": now >= probe_allowed_at,
+            })
+        return result
+
     con = _admin_db()
-    rows = con.execute("""SELECT title, feed_url, status, last_ok_ts, last_error_ts,
+    legacy_rows = con.execute("""SELECT title, feed_url, status, last_ok_ts, last_error_ts,
         error, last_count, duration_ms FROM feed_health ORDER BY title COLLATE NOCASE""").fetchall()
     con.close()
     result = []
-    for r in rows:
+    for r in legacy_rows:
         last_ok = r[3] or 0
         last_error = r[4] or 0
         result.append({
@@ -1717,6 +1944,17 @@ def _clean_journal_name(value):
     raw = re.sub(r"\s*[-–—|]\s*(Latest articles|Articles in press|Table of contents)\s*$", "", raw, flags=re.I)
     raw = re.sub(r"\s+", " ", raw).strip(" \t\r\n:;-")
     return raw[:80]
+
+
+# 与客户端 journalGroupKey 归一算法逐字对齐（DigestUi.kt）：
+# cleanJournalName → 空则“未标注期刊” → 小写 → [ASCII 标点+空白]+ 折成单空格 → 去首尾空白。
+# [\s!-/:-@\[-`{-~] 覆盖 Java \p{Punct} 的 32 个 ASCII 标点及所有空白字符。
+_JOURNAL_GROUP_KEY_RE = re.compile(r"[\s!-/:-@\[-`{-~]+")
+
+
+def _journal_group_key(journal):
+    name = _clean_journal_name(journal) or "未标注期刊"
+    return _JOURNAL_GROUP_KEY_RE.sub(" ", name.lower()).strip()
 
 
 def _normalize_title_match(value):
@@ -1846,11 +2084,13 @@ def _digest_from_file(path):
 
 
 def _upsert_digest(con, digest):
+    journal = digest.get("journal", "")
+    group_key = _journal_group_key(journal)
     con.execute("""INSERT INTO digests
         (filename, timestamp, title, cn_title, keywords, journal, source, preview,
          relevance_score, novelty_score, final_score, recommendation_type,
-         interest_profile_version, scored_at, created_ts)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         interest_profile_version, scored_at, created_ts, journal_group_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(filename) DO UPDATE SET
             timestamp=excluded.timestamp,
             title=excluded.title,
@@ -1865,15 +2105,17 @@ def _upsert_digest(con, digest):
             recommendation_type=excluded.recommendation_type,
             interest_profile_version=excluded.interest_profile_version,
             scored_at=excluded.scored_at,
-            created_ts=excluded.created_ts""",
+            created_ts=excluded.created_ts,
+            journal_group_key=excluded.journal_group_key""",
                 (digest["filename"], digest["timestamp"], digest["title"],
                  digest.get("cn_title", ""), digest.get("keywords", ""),
-                 digest.get("journal", ""), digest.get("source", "rss"),
+                 journal, digest.get("source", "rss"),
                  digest.get("preview", ""), digest.get("relevance_score"),
                  digest.get("novelty_score"), digest.get("final_score"),
                  digest.get("recommendation_type", ""),
                  int(digest.get("interest_profile_version") or 0),
-                 int(digest.get("scored_at") or 0), digest["created_ts"]))
+                 int(digest.get("scored_at") or 0), digest["created_ts"],
+                 group_key))
 
 
 # inbox 索引哨兵：读/轮询接口此前每次都全量重扫 inbox（每文件读盘+~15条正则+upsert），
@@ -3022,15 +3264,139 @@ def _entry_published_ts(entry):
     return 0
 
 
-def _fetch_single_feed(feed, per_feed_limit, since_ts=0):
-    """抓取单个RSS源，返回 (feed, entries, error)"""
+def _clamp_rss_interval(seconds):
+    return max(
+        RSS_MIN_INTERVAL_SECONDS,
+        min(int(seconds or RSS_DEFAULT_INTERVAL_SECONDS), RSS_MAX_INTERVAL_SECONDS),
+    )
+
+
+def _response_cache_hint_seconds(response, parsed=None, now=None):
+    now = time.time() if now is None else float(now)
+    candidates = []
+    cache_control = str(response.headers.get("Cache-Control") or "")
+    match = re.search(r"(?:^|,)\s*max-age\s*=\s*\"?(\d+)", cache_control, re.I)
+    if match:
+        candidates.append(int(match.group(1)))
+    expires = str(response.headers.get("Expires") or "").strip()
+    if expires:
+        try:
+            candidates.append(max(0, int(parsedate_to_datetime(expires).timestamp() - now)))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    if parsed is not None:
+        ttl = getattr(getattr(parsed, "feed", None), "ttl", None)
+        if ttl is None and isinstance(getattr(parsed, "feed", None), dict):
+            ttl = parsed.feed.get("ttl")
+        try:
+            if ttl is not None:
+                candidates.append(int(float(ttl)) * 60)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    candidates = [value for value in candidates if value > 0]
+    return _clamp_rss_interval(max(candidates)) if candidates else 0
+
+
+def _http_error_category(status):
+    if status in {401, 403}:
+        return "access_denied"
+    if status == 429:
+        return "rate_limited"
+    if status == 404:
+        return "not_found"
+    if status == 410:
+        return "gone"
+    if status == 408 or status >= 500:
+        return "server_error"
+    if 400 <= status < 500:
+        return "client_error"
+    return "http_error"
+
+
+def _fetch_exception_category(exc):
+    if isinstance(exc, UnsafeOutboundURLError):
+        return "unsafe_url"
+    if isinstance(exc, requests.exceptions.SSLError):
+        return "tls_error"
+    if isinstance(exc, requests.TooManyRedirects):
+        return "redirect_error"
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return "network_error"
+    return "network_error"
+
+
+def _fetch_single_feed(
+    feed,
+    per_feed_limit,
+    since_ts=0,
+    state=None,
+    *,
+    max_attempts=2,
+    session=None,
+):
+    """抓取单个 RSS 源，返回带 HTTP/错误分类的结构化结果。"""
+
     start = time.time()
+    state = state or {}
+    conditional_headers = {}
+    if state.get("etag"):
+        conditional_headers["If-None-Match"] = state["etag"]
+    if state.get("last_modified"):
+        conditional_headers["If-Modified-Since"] = state["last_modified"]
     try:
-        r = http_get(feed["url"], timeout=35, max_attempts=3)
-        parsed = feedparser.parse(r.content)
+        response = http_get(
+            feed["url"],
+            timeout=35,
+            max_attempts=max_attempts,
+            headers=conditional_headers,
+            session=session,
+        )
+        status = int(getattr(response, "status_code", 0) or 0)
+        common = {
+            "duration_ms": int((time.time() - start) * 1000),
+            "http_status": status,
+            "etag": str(response.headers.get("ETag") or ""),
+            "last_modified": str(response.headers.get("Last-Modified") or ""),
+            "final_url": str(getattr(response, "url", "") or feed["url"]),
+            "retry_after_seconds": _retry_after_seconds(
+                response.headers.get("Retry-After")
+            ),
+        }
+        if status == 304:
+            response.close()
+            return FeedFetchResult(
+                feed=feed,
+                category="not_modified",
+                cache_hint_seconds=_response_cache_hint_seconds(response),
+                **common,
+            )
+        if status != 200:
+            error = f"HTTP {status}"
+            response.close()
+            return FeedFetchResult(
+                feed=feed,
+                category=_http_error_category(status),
+                error=error,
+                **common,
+            )
+
+        parsed = feedparser.parse(response.content)
+        cache_hint = _response_cache_hint_seconds(response, parsed)
+        response.close()
+        parsed_entries = list(getattr(parsed, "entries", []) or [])
+        if getattr(parsed, "bozo", False) and not parsed_entries:
+            parse_error = getattr(parsed, "bozo_exception", None)
+            return FeedFetchResult(
+                feed=feed,
+                category="invalid_feed",
+                error=redact_sensitive_text(str(parse_error or "RSS 无法解析")),
+                cache_hint_seconds=cache_hint,
+                **common,
+            )
+
         entries = []
         skipped_old = 0
-        for entry in getattr(parsed, "entries", []):
+        for entry in parsed_entries:
             published_ts = _entry_published_ts(entry)
             if since_ts and published_ts and published_ts < since_ts:
                 skipped_old += 1
@@ -3038,9 +3404,38 @@ def _fetch_single_feed(feed, per_feed_limit, since_ts=0):
             entries.append(entry)
             if len(entries) >= per_feed_limit:
                 break
-        return feed, entries, None, int((time.time() - start) * 1000), skipped_old
-    except Exception as e:
-        return feed, [], str(e), int((time.time() - start) * 1000), 0
+        return FeedFetchResult(
+            feed=feed,
+            entries=entries,
+            category="ok",
+            skipped_old=skipped_old,
+            cache_hint_seconds=cache_hint,
+            **common,
+        )
+    except Exception as exc:
+        return FeedFetchResult(
+            feed=feed,
+            category=_fetch_exception_category(exc),
+            error=redact_sensitive_text(str(exc)),
+            duration_ms=int((time.time() - start) * 1000),
+        )
+
+
+def _coerce_fetch_result(value, feed=None):
+    if isinstance(value, FeedFetchResult):
+        return value
+    if isinstance(value, tuple) and len(value) >= 5:
+        legacy_feed, entries, error, duration_ms, skipped_old = value[:5]
+        return FeedFetchResult(
+            feed=legacy_feed or feed or {},
+            entries=list(entries or []),
+            category="network_error" if error else "ok",
+            error=str(error or ""),
+            duration_ms=int(duration_ms or 0),
+            skipped_old=int(skipped_old or 0),
+            http_status=0 if error else 200,
+        )
+    raise TypeError("无效的 RSS 抓取结果")
 
 
 def collect_new(opml_path, db_path, per_feed_limit=3, progress_callback=None, since_ts=0):
@@ -3059,8 +3454,18 @@ def collect_new(opml_path, db_path, per_feed_limit=3, progress_callback=None, si
 
         for future in as_completed(futures):
             done += 1
-            feed, entries, error, duration_ms, skipped_old = future.result()
-            record_feed_health(feed, ok=not error, count=len(entries), error=error or "", duration_ms=duration_ms)
+            result = _coerce_fetch_result(future.result(), futures[future])
+            feed = result.feed
+            entries = result.entries
+            error = None if result.ok else result.error
+            skipped_old = result.skipped_old
+            record_feed_health(
+                feed,
+                ok=result.ok,
+                count=len(entries),
+                error=error or "",
+                duration_ms=result.duration_ms,
+            )
 
             if progress_callback:
                 progress_callback(done, total, f"[{done}/{total}] {feed['title']}")
@@ -3481,66 +3886,649 @@ def _active_tenant_feed_union():
     return feeds
 
 
-def _shared_collect_new(feeds, per_feed_limit=3, progress_callback=None, since_ts=0):
+def _rss_discovery_interval_seconds(config=None):
+    cfg = config or load_config()
+    try:
+        minutes = int(
+            (cfg.get("schedule") or {}).get(
+                "rss_discovery_interval_minutes",
+                RSS_DEFAULT_INTERVAL_SECONDS // 60,
+            )
+        )
+    except (TypeError, ValueError):
+        minutes = RSS_DEFAULT_INTERVAL_SECONDS // 60
+    return _clamp_rss_interval(max(15, minutes) * 60)
+
+
+def _legacy_blocked_feed_urls():
+    """Read legacy display-only health rows once when seeding fetch state."""
+
+    try:
+        con = _admin_db()
+        rows = con.execute(
+            """SELECT feed_url, error FROM feed_health
+            WHERE status='error' AND error LIKE '%403%'"""
+        ).fetchall()
+        con.close()
+        return {str(url): str(error or "HTTP 403") for url, error in rows}
+    except Exception:
+        logger.debug("读取旧 RSS 403 状态失败", exc_info=True)
+        return {}
+
+
+def sync_shared_feed_fetch_state(feeds=None, now=None):
+    """Ensure every active union feed has persistent scheduling state."""
+
+    feeds = _active_tenant_feed_union() if feeds is None else dict(feeds)
+    now = int(time.time() if now is None else now)
+    legacy_blocked = _legacy_blocked_feed_urls()
+    con = _shared_content_db()
+    con.execute("UPDATE feed_fetch_state SET active=0")
+    for url, title in feeds.items():
+        normalized = _normalize_feed_url(url)
+        host = (urlsplit(normalized).hostname or "").lower()
+        if not host:
+            continue
+        exists = con.execute(
+            "SELECT 1 FROM feed_fetch_state WHERE feed_url=?",
+            (normalized,),
+        ).fetchone()
+        if not exists:
+            legacy_error = legacy_blocked.get(normalized, "")
+            blocked_until = now + 24 * 60 * 60 if legacy_error else 0
+            stagger = int(hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8], 16) % (
+                15 * 60
+            )
+            next_fetch = blocked_until or (now + stagger)
+            con.execute(
+                """INSERT INTO feed_fetch_state(
+                    feed_url, host, title, error_category, error,
+                    consecutive_failures, effective_interval_seconds,
+                    next_fetch_ts, blocked_until_ts, active, updated_ts
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    normalized,
+                    host,
+                    str(title or normalized),
+                    "access_denied" if legacy_error else "",
+                    legacy_error[:500],
+                    1 if legacy_error else 0,
+                    RSS_DEFAULT_INTERVAL_SECONDS,
+                    next_fetch,
+                    blocked_until,
+                    1,
+                    now,
+                ),
+            )
+        else:
+            con.execute(
+                """UPDATE feed_fetch_state
+                SET host=?, title=?, active=1, updated_ts=?
+                WHERE feed_url=?""",
+                (host, str(title or normalized), now, normalized),
+            )
+        con.execute(
+            """INSERT OR IGNORE INTO host_fetch_state(host, updated_ts)
+            VALUES(?,?)""",
+            (host, now),
+        )
+    con.commit()
+    con.close()
+    return len(feeds)
+
+
+def _claim_due_shared_feeds(feeds, now=None, force_url=None):
+    now = int(time.time() if now is None else now)
+    sync_shared_feed_fetch_state(feeds, now=now)
+    force_url = _normalize_feed_url(force_url) if force_url else ""
+    con = _shared_content_db()
+    con.row_factory = sqlite3.Row
+    claimed = []
+    claimed_hosts = set()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        for url, title in feeds.items():
+            normalized = _normalize_feed_url(url)
+            if force_url and normalized != force_url:
+                continue
+            row = con.execute(
+                """SELECT feed.*, host_state.next_allowed_ts AS host_next_allowed_ts,
+                    host_state.blocked_until_ts AS host_blocked_until_ts,
+                    host_state.lease_until_ts AS host_lease_until_ts
+                FROM feed_fetch_state AS feed
+                JOIN host_fetch_state AS host_state ON host_state.host=feed.host
+                WHERE feed.feed_url=?""",
+                (normalized,),
+            ).fetchone()
+            if not row or (row["disabled"] and not force_url):
+                continue
+            host = row["host"]
+            if host in claimed_hosts:
+                host_ready = True
+            else:
+                host_ready = int(row["host_lease_until_ts"] or 0) <= now
+                if not force_url:
+                    host_ready = host_ready and max(
+                        int(row["host_next_allowed_ts"] or 0),
+                        int(row["host_blocked_until_ts"] or 0),
+                    ) <= now
+            feed_ready = int(row["lease_until_ts"] or 0) <= now
+            if not force_url:
+                feed_ready = feed_ready and max(
+                    int(row["next_fetch_ts"] or 0),
+                    int(row["blocked_until_ts"] or 0),
+                ) <= now
+            if not host_ready or not feed_ready:
+                continue
+            if host not in claimed_hosts:
+                con.execute(
+                    "UPDATE host_fetch_state SET lease_until_ts=?, updated_ts=? WHERE host=?",
+                    (now + RSS_FEED_LEASE_SECONDS, now, host),
+                )
+                claimed_hosts.add(host)
+            con.execute(
+                "UPDATE feed_fetch_state SET lease_until_ts=?, updated_ts=? WHERE feed_url=?",
+                (now + RSS_FEED_LEASE_SECONDS, now, normalized),
+            )
+            state = dict(row)
+            state["title"] = title or state.get("title") or normalized
+            claimed.append(state)
+        con.commit()
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    return claimed
+
+
+def _release_shared_host_lease(host, now=None):
+    con = _shared_content_db()
+    normalized_host = str(host or "").lower()
+    con.execute(
+        "UPDATE host_fetch_state SET lease_until_ts=0, updated_ts=? WHERE host=?",
+        (int(time.time() if now is None else now), normalized_host),
+    )
+    con.execute(
+        "UPDATE feed_fetch_state SET lease_until_ts=0 WHERE host=?",
+        (normalized_host,),
+    )
+    con.commit()
+    con.close()
+
+
+def _feed_failure_policy(category, failures, retry_after=0):
+    exponent = max(0, int(failures) - 1)
+    if category == "access_denied":
+        return min(24 * 60 * 60 * (2 ** exponent), 7 * 24 * 60 * 60), False
+    if category == "rate_limited":
+        delay = max(int(retry_after or 0), 6 * 60 * 60 * (2 ** exponent))
+        return min(delay, 7 * 24 * 60 * 60), False
+    if category == "not_found":
+        return min(24 * 60 * 60 * (2 ** exponent), 7 * 24 * 60 * 60), failures >= 3
+    if category == "gone":
+        return 7 * 24 * 60 * 60, True
+    if category == "client_error":
+        return min(24 * 60 * 60 * (2 ** exponent), 7 * 24 * 60 * 60), failures >= 3
+    if category in {"unsafe_url", "tls_error"}:
+        return 7 * 24 * 60 * 60, True
+    if category in {"invalid_feed", "redirect_error"}:
+        return min(6 * 60 * 60 * (2 ** exponent), 24 * 60 * 60), False
+    return min(15 * 60 * (2 ** exponent), 6 * 60 * 60), False
+
+
+def _record_shared_fetch_result(
+    result,
+    *,
+    new_count=0,
+    fallback_interval=RSS_DEFAULT_INTERVAL_SECONDS,
+    now=None,
+):
+    now = int(time.time() if now is None else now)
+    url = _normalize_feed_url(result.feed.get("url", ""))
+    host = (urlsplit(url).hostname or "").lower()
+    con = _shared_content_db()
+    con.row_factory = sqlite3.Row
+    row = con.execute(
+        "SELECT * FROM feed_fetch_state WHERE feed_url=?",
+        (url,),
+    ).fetchone()
+    if not row:
+        con.close()
+        raise RuntimeError(f"RSS 状态不存在: {url}")
+
+    if result.ok:
+        base_interval = _clamp_rss_interval(
+            result.cache_hint_seconds or fallback_interval
+        )
+        previous_interval = _clamp_rss_interval(
+            row["effective_interval_seconds"] or fallback_interval
+        )
+        if new_count > 0:
+            interval = base_interval
+            unchanged_count = 0
+        else:
+            interval = max(
+                base_interval,
+                min(previous_interval * 2, RSS_UNCHANGED_MAX_INTERVAL_SECONDS),
+            )
+            interval = min(interval, RSS_MAX_INTERVAL_SECONDS)
+            unchanged_count = int(row["unchanged_count"] or 0) + 1
+        next_fetch = now + max(
+            RSS_MIN_INTERVAL_SECONDS,
+            int(interval * random.uniform(0.9, 1.1)),
+        )
+        con.execute(
+            """UPDATE feed_fetch_state SET
+                etag=CASE WHEN ?<>'' THEN ? ELSE etag END,
+                last_modified=CASE WHEN ?<>'' THEN ? ELSE last_modified END,
+                resolved_url=CASE WHEN ?<>'' THEN ? ELSE resolved_url END,
+                last_checked_ts=?, last_success_ts=?, last_http_status=?,
+                error_category=?, error='', consecutive_failures=0,
+                unchanged_count=?, effective_interval_seconds=?,
+                next_fetch_ts=?, blocked_until_ts=0, lease_until_ts=0,
+                disabled=0, disabled_reason='', updated_ts=?
+            WHERE feed_url=?""",
+            (
+                result.etag,
+                result.etag,
+                result.last_modified,
+                result.last_modified,
+                result.final_url,
+                result.final_url,
+                now,
+                now,
+                result.http_status,
+                result.category,
+                unchanged_count,
+                interval,
+                next_fetch,
+                now,
+                url,
+            ),
+        )
+        con.execute(
+            """UPDATE host_fetch_state SET
+                next_allowed_ts=?, blocked_until_ts=0,
+                access_failure_count=0, last_http_status=?,
+                updated_ts=?
+            WHERE host=?""",
+            (
+                now + random.randint(*RSS_HOST_GAP_SECONDS),
+                result.http_status,
+                now,
+                host,
+            ),
+        )
+    else:
+        failures = int(row["consecutive_failures"] or 0) + 1
+        delay, disabled = _feed_failure_policy(
+            result.category,
+            failures,
+            result.retry_after_seconds,
+        )
+        blocked_until = now + delay
+        disabled_reason = result.category if disabled else ""
+        con.execute(
+            """UPDATE feed_fetch_state SET
+                resolved_url=CASE WHEN ?<>'' THEN ? ELSE resolved_url END,
+                last_checked_ts=?, last_http_status=?, error_category=?,
+                error=?, consecutive_failures=?, next_fetch_ts=?,
+                blocked_until_ts=?, lease_until_ts=0, disabled=?,
+                disabled_reason=?, updated_ts=?
+            WHERE feed_url=?""",
+            (
+                result.final_url,
+                result.final_url,
+                now,
+                result.http_status,
+                result.category,
+                str(result.error or "")[:500],
+                failures,
+                blocked_until,
+                blocked_until,
+                1 if disabled else 0,
+                disabled_reason,
+                now,
+                url,
+            ),
+        )
+
+        host_row = con.execute(
+            "SELECT * FROM host_fetch_state WHERE host=?",
+            (host,),
+        ).fetchone()
+        host_failures = int(host_row["access_failure_count"] or 0)
+        host_blocked_until = int(host_row["blocked_until_ts"] or 0)
+        if result.category == "access_denied":
+            other_denied = con.execute(
+                """SELECT 1 FROM feed_fetch_state
+                WHERE host=? AND feed_url<>? AND error_category='access_denied'
+                    AND last_checked_ts>=? LIMIT 1""",
+                (host, url, now - 24 * 60 * 60),
+            ).fetchone()
+            host_failures += 1
+            if other_denied:
+                host_delay = min(
+                    24 * 60 * 60 * (2 ** max(0, host_failures - 2)),
+                    7 * 24 * 60 * 60,
+                )
+            else:
+                host_delay = 60 * 60
+            host_blocked_until = max(host_blocked_until, now + host_delay)
+        elif result.category == "rate_limited":
+            host_failures += 1
+            host_delay = max(
+                int(result.retry_after_seconds or 0),
+                min(
+                    6 * 60 * 60 * (2 ** max(0, host_failures - 1)),
+                    7 * 24 * 60 * 60,
+                ),
+            )
+            host_blocked_until = max(host_blocked_until, now + host_delay)
+        con.execute(
+            """UPDATE host_fetch_state SET
+                next_allowed_ts=?, blocked_until_ts=?,
+                access_failure_count=?, last_http_status=?,
+                last_error_ts=?, updated_ts=?
+            WHERE host=?""",
+            (
+                now + random.randint(*RSS_HOST_GAP_SECONDS),
+                host_blocked_until,
+                host_failures,
+                result.http_status,
+                now,
+                now,
+                host,
+            ),
+        )
+    con.commit()
+    con.close()
+    record_feed_health(
+        result.feed,
+        ok=result.ok,
+        count=int(new_count),
+        error="" if result.ok else result.error,
+        duration_ms=result.duration_ms,
+    )
+
+
+def _next_shared_fetch_ts(feeds, now=None):
+    now = int(time.time() if now is None else now)
+    con = _shared_content_db()
+    values = []
+    for url in feeds:
+        row = con.execute(
+            """SELECT feed.next_fetch_ts, feed.blocked_until_ts,
+                feed.disabled, host.next_allowed_ts, host.blocked_until_ts
+            FROM feed_fetch_state AS feed
+            JOIN host_fetch_state AS host ON host.host=feed.host
+            WHERE feed.feed_url=?""",
+            (_normalize_feed_url(url),),
+        ).fetchone()
+        if row and not row[2]:
+            values.append(max(int(row[0] or 0), int(row[1] or 0), int(row[3] or 0), int(row[4] or 0)))
+    con.close()
+    return max(now + 60, min(values)) if values else now + RSS_DEFAULT_INTERVAL_SECONDS
+
+
+def _fetch_host_group(host, states, per_feed_limit, since_ts, *, probe=False):
+    results = []
+    session = _make_pinned_feed_session(host)
+    try:
+        for index, state in enumerate(states):
+            feed = {"title": state.get("title") or state["feed_url"], "url": state["feed_url"]}
+            result = _coerce_fetch_result(
+                _fetch_single_feed(
+                    feed,
+                    per_feed_limit,
+                    since_ts,
+                    state,
+                    max_attempts=1 if probe else 2,
+                    session=session,
+                ),
+                feed,
+            )
+            results.append(result)
+            if result.category in {"access_denied", "rate_limited"}:
+                break
+            if index < len(states) - 1:
+                time.sleep(random.uniform(*RSS_HOST_GAP_SECONDS))
+    finally:
+        session.close()
+    return results
+
+
+def _shared_item_from_entry(feed, entry):
+    title = _clean(getattr(entry, "title", "无标题"), 240)
+    link = getattr(entry, "link", "") or ""
+    summary_raw = (
+        getattr(entry, "summary", "") or getattr(entry, "description", "") or ""
+    )
+    summary = _clean(summary_raw, 1200)
+    authors = _get_authors(entry)
+    pub_date, source_info = _extract_pub_info(summary_raw)
+    return {
+        "feed": feed["title"],
+        "title": title,
+        "summary": summary,
+        "link": link,
+        "doi": _find_doi(title, summary_raw, link),
+        "authors": authors,
+        "first_author": authors[0] if authors else "未提供",
+        "corresponding_author": "未提供",
+        "publication_date": pub_date,
+        "publication_ts": _entry_published_ts(entry),
+        "source_info": source_info,
+        "article_type": _classify_type(title, summary_raw, feed["title"]),
+        "feed_url": feed["url"],
+        "feed_title": feed["title"],
+    }
+
+
+def _store_shared_fetch_entries(con, result):
+    new_items = []
+    for entry in result.entries:
+        item = _shared_item_from_entry(result.feed, entry)
+        item_key = _rss_item_key(item)
+        if not item_key:
+            continue
+        if con.execute(
+            "SELECT 1 FROM shared_seen WHERE item_key=?",
+            (item_key,),
+        ).fetchone():
+            continue
+        con.execute(
+            "INSERT OR IGNORE INTO shared_seen(item_key, link, feed_url, ts) VALUES(?,?,?,?)",
+            (item_key, item["link"], result.feed["url"], int(time.time())),
+        )
+        con.execute(
+            """INSERT OR IGNORE INTO shared_queue(item_key, item_json, status, created_ts)
+            VALUES(?,?, 'pending', ?)""",
+            (item_key, _json_dumps(item), int(time.time())),
+        )
+        new_items.append(item)
+    con.commit()
+    return new_items
+
+
+def _shared_collect_new(
+    feeds,
+    per_feed_limit=3,
+    progress_callback=None,
+    since_ts=0,
+    fallback_interval=RSS_DEFAULT_INTERVAL_SECONDS,
+):
     """按并集抓取 RSS，对 shared_seen 去重，返回新 item 列表（附 feed_url/feed_title）。"""
+
+    claimed = _claim_due_shared_feeds(feeds)
     con = _shared_content_db()
     new_items = []
-    total = len(feeds)
+    total = len(claimed)
     done = 0
-    feed_list = [{"title": title, "url": url} for url, title in feeds.items()]
+    groups = {}
+    for state in claimed:
+        groups.setdefault(state["host"], []).append(state)
+    if not groups:
+        con.close()
+        return []
 
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=min(RSS_HOST_WORKERS, len(groups))) as executor:
         futures = {
-            executor.submit(_fetch_single_feed, feed, per_feed_limit, since_ts): feed
-            for feed in feed_list
+            executor.submit(
+                _fetch_host_group,
+                host,
+                states,
+                per_feed_limit,
+                since_ts,
+            ): (host, states)
+            for host, states in groups.items()
         }
         for future in as_completed(futures):
-            done += 1
-            feed, entries, error, duration_ms, skipped_old = future.result()
-            record_feed_health(feed, ok=not error, count=len(entries), error=error or "", duration_ms=duration_ms)
-            if progress_callback:
-                progress_callback(done, total, f"[{done}/{total}] {feed['title']}")
-            if error:
-                logger.error(f"共享抓取失败: {feed['title']} - {error}")
-                continue
-            for entry in entries:
-                title = _clean(getattr(entry, "title", "无标题"), 240)
-                link = getattr(entry, "link", "") or ""
-                summary_raw = (getattr(entry, "summary", "") or
-                               getattr(entry, "description", "") or "")
-                summary = _clean(summary_raw, 1200)
-                authors = _get_authors(entry)
-                pub_date, source_info = _extract_pub_info(summary_raw)
-                publication_ts = _entry_published_ts(entry)
-                doi = _find_doi(title, summary_raw, link)
-                item = {
-                    "feed": feed["title"], "title": title, "summary": summary,
-                    "link": link, "doi": doi, "authors": authors,
-                    "first_author": authors[0] if authors else "未提供",
-                    "corresponding_author": "未提供",
-                    "publication_date": pub_date, "publication_ts": publication_ts,
-                    "source_info": source_info,
-                    "article_type": _classify_type(title, summary_raw, feed["title"]),
-                    "feed_url": feed["url"], "feed_title": feed["title"],
-                }
-                item_key = _rss_item_key(item)
-                if not item_key:
-                    continue
-                if con.execute("SELECT 1 FROM shared_seen WHERE item_key=?", (item_key,)).fetchone():
-                    continue
-                con.execute(
-                    "INSERT OR IGNORE INTO shared_seen(item_key, link, feed_url, ts) VALUES(?,?,?,?)",
-                    (item_key, link, feed["url"], int(time.time())),
-                )
-                con.execute(
-                    """INSERT OR IGNORE INTO shared_queue(item_key, item_json, status, created_ts)
-                    VALUES(?,?, 'pending', ?)""",
-                    (item_key, _json_dumps(item), int(time.time())),
-                )
-                con.commit()
-                new_items.append(item)
+            host, states = futures[future]
+            try:
+                results = future.result()
+                for raw_result in results:
+                    result = _coerce_fetch_result(raw_result)
+                    done += 1
+                    if progress_callback:
+                        progress_callback(
+                            done,
+                            total,
+                            f"[{done}/{total}] {result.feed['title']}",
+                        )
+                    added = _store_shared_fetch_entries(con, result) if result.ok else []
+                    new_items.extend(added)
+                    _record_shared_fetch_result(
+                        result,
+                        new_count=len(added),
+                        fallback_interval=fallback_interval,
+                    )
+                    if result.skipped_old:
+                        logger.info(
+                            "跳过过期 RSS: %s - %s 篇",
+                            result.feed["title"],
+                            result.skipped_old,
+                        )
+                    if not result.ok:
+                        logger.error(
+                            "共享抓取失败: %s - %s (%s)",
+                            result.feed["title"],
+                            result.error,
+                            result.category,
+                        )
+            except Exception:
+                con.close()
+                raise
+            finally:
+                _release_shared_host_lease(host)
     con.close()
     return new_items
+
+
+def probe_shared_rss_feed(url, *, override_cooldown=False, now=None):
+    """Operator-only caller helper: probe one subscribed feed with one request."""
+
+    now = int(time.time() if now is None else now)
+    normalized = _normalize_feed_url(url)
+    feeds = _active_tenant_feed_union()
+    if normalized not in feeds:
+        return {"ok": False, "error": "not_subscribed", "status_code": 400}
+    sync_shared_feed_fetch_state(feeds, now=now)
+    con = _shared_content_db()
+    con.row_factory = sqlite3.Row
+    row = con.execute(
+        """SELECT feed.*, host.last_probe_ts, host.next_allowed_ts,
+            host.blocked_until_ts AS host_blocked_until_ts,
+            host.lease_until_ts AS host_lease_until_ts
+        FROM feed_fetch_state AS feed
+        JOIN host_fetch_state AS host ON host.host=feed.host
+        WHERE feed.feed_url=?""",
+        (normalized,),
+    ).fetchone()
+    con.close()
+    if not row:
+        return {"ok": False, "error": "state_missing", "status_code": 500}
+    last_probe = int(row["last_probe_ts"] or 0)
+    probe_allowed_at = (
+        last_probe + RSS_PROBE_COOLDOWN_SECONDS if last_probe else 0
+    )
+    if probe_allowed_at > now:
+        return {
+            "ok": False,
+            "error": "probe_rate_limited",
+            "status_code": 429,
+            "retry_after": probe_allowed_at - now,
+        }
+    ready_at = max(
+        int(row["next_fetch_ts"] or 0),
+        int(row["blocked_until_ts"] or 0),
+        int(row["next_allowed_ts"] or 0),
+        int(row["host_blocked_until_ts"] or 0),
+    )
+    if ready_at > now and not override_cooldown:
+        return {
+            "ok": False,
+            "error": "feed_cooldown",
+            "status_code": 409,
+            "retry_after": ready_at - now,
+        }
+
+    claimed = _claim_due_shared_feeds(feeds, now=now, force_url=normalized)
+    if not claimed:
+        return {
+            "ok": False,
+            "error": "feed_busy",
+            "status_code": 409,
+            "retry_after": 60,
+        }
+    state = claimed[0]
+    host = state["host"]
+    marker = _shared_content_db()
+    marker.execute(
+        "UPDATE host_fetch_state SET last_probe_ts=?, updated_ts=? WHERE host=?",
+        (now, now, host),
+    )
+    marker.commit()
+    marker.close()
+    try:
+        result = _fetch_host_group(
+            host,
+            [state],
+            per_feed_limit=load_config().get("rss", {}).get("per_feed_limit", 3),
+            since_ts=get_rss_fetch_window()["fetch_since_ts"],
+            probe=True,
+        )[0]
+        store = _shared_content_db()
+        added = _store_shared_fetch_entries(store, result) if result.ok else []
+        store.close()
+        _record_shared_fetch_result(
+            result,
+            new_count=len(added),
+            fallback_interval=_rss_discovery_interval_seconds(),
+            now=now,
+        )
+        updated = _shared_content_db()
+        state_row = updated.execute(
+            """SELECT next_fetch_ts, blocked_until_ts, disabled
+            FROM feed_fetch_state WHERE feed_url=?""",
+            (normalized,),
+        ).fetchone()
+        updated.close()
+        return {
+            "ok": result.ok,
+            "url": normalized,
+            "upstream_status": result.http_status,
+            "category": result.category,
+            "error": result.error,
+            "new_items": len(added),
+            "next_fetch_ts": int(state_row[0] or 0),
+            "blocked_until_ts": int(state_row[1] or 0),
+            "disabled": bool(state_row[2]),
+            "status_code": 200,
+        }
+    finally:
+        _release_shared_host_lease(host)
 
 
 def run_shared_rss_ingest(progress_callback=None):
@@ -3550,8 +4538,10 @@ def run_shared_rss_ingest(progress_callback=None):
         raise RuntimeError("共享内容消化只能在 owner 上下文运行")
     cfg = load_config()
     per_feed = cfg.get("rss", {}).get("per_feed_limit", 3)
+    fallback_interval = _rss_discovery_interval_seconds(cfg)
     window = get_rss_fetch_window(cfg)
     feeds = _active_tenant_feed_union()
+    sync_shared_feed_fetch_state(feeds)
     if progress_callback:
         progress_callback(0, 0, f"共享抓取：{len(feeds)} 个订阅源，最近 {window['lookback_days']} 天")
     record_event("shared_ingest", "共享消化开始", details={
@@ -3560,6 +4550,7 @@ def run_shared_rss_ingest(progress_callback=None):
     discovered = _shared_collect_new(
         feeds, per_feed_limit=per_feed,
         progress_callback=progress_callback, since_ts=window["fetch_since_ts"],
+        fallback_interval=fallback_interval,
     )
 
     # 消化 shared_queue 中所有 pending 项（含本轮新发现的）。
@@ -3610,7 +4601,11 @@ def run_shared_rss_ingest(progress_callback=None):
         cleanup_shared_retention()
     except Exception:
         logger.exception("共享缓存保留清理失败")
-    return {"discovered": len(discovered), "digested": digested}
+    return {
+        "discovered": len(discovered),
+        "digested": digested,
+        "next_run_at": _next_shared_fetch_ts(feeds),
+    }
 
 
 def _mark_shared_queue(queue_id, status, error=""):
@@ -4140,7 +5135,9 @@ def get_status():
     cfg = load_config()
     schedule = cfg.get("schedule", {})
     rss_int = schedule.get("rss_interval_minutes", 30)
-    rss_discovery_int = schedule.get("rss_discovery_interval_minutes", rss_int)
+    rss_discovery_int = max(
+        15, int(schedule.get("rss_discovery_interval_minutes", 60) or 60)
+    )
     pdf_int = schedule.get("pdf_interval_minutes", 5)
     enabled = schedule.get("enabled", True)
 
@@ -4374,7 +5371,7 @@ def get_admin_settings():
     rss["preference_weights"] = _preference_weights(cfg)
     rss.update(get_rss_fetch_window(cfg))
     schedule = cfg.setdefault("schedule", {})
-    schedule.setdefault("rss_discovery_interval_minutes", schedule.get("rss_interval_minutes", 30))
+    schedule.setdefault("rss_discovery_interval_minutes", 60)
     server = cfg.setdefault("server", {})
     effective_host = os.environ.get("RSSAI_SERVER_HOST", server.get("host", "0.0.0.0"))
     effective_port = int(os.environ.get("RSSAI_SERVER_PORT", server.get("port", 5000)))
@@ -4529,7 +5526,8 @@ def reset_seen_to_recent_week():
     con.close()
 
 
-def get_recent_digests(limit=None, source=None, recommendation=None):
+def get_recent_digests(limit=None, source=None, recommendation=None,
+                       journal_group_key=None, interested_only=False):
     if limit is not None:
         limit = int(limit)
         if limit <= 0:
@@ -4548,6 +5546,12 @@ def get_recent_digests(limit=None, source=None, recommendation=None):
         elif recommendation in {"ai", "explore"}:
             clauses.append("recommendation_type=?")
             params.append(recommendation)
+        # 分组模式展开某期刊：按分组键精确过滤（空串="未标注期刊"组）。
+        if journal_group_key is not None:
+            clauses.append("journal_group_key=?")
+            params.append(journal_group_key)
+        if interested_only:
+            clauses.append("interested=1")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         limit_clause = ""
         if limit is not None:
@@ -4622,6 +5626,48 @@ def get_digest_stats(source=None):
         "source": source or "",
         "total": int(row[0] or 0),
         "read": int(row[1] or 0),
+    }
+
+
+def get_journal_stats(source=None):
+    """按期刊分组的篇数与已读数（折叠时用，不加载卡片）。
+
+    journals: [{key,title,total,read}]，key 为分组键（空串=未标注期刊）；
+    interested: 跨期刊“感兴趣”伪分组的 {total,read}。
+    """
+    _sync_digest_index()
+    con = _digest_db()
+    base, params = ["deleted=0"], []
+    if source:
+        base.append("source=?")
+        params.append(source)
+    where = "WHERE " + " AND ".join(base)
+    rows = con.execute(
+        f"""SELECT journal_group_key, MAX(journal), COUNT(*),
+            COALESCE(SUM(is_read),0)
+            FROM digests {where}
+            GROUP BY journal_group_key""",
+        params,
+    ).fetchall()
+    interested_row = con.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(is_read),0) FROM digests {where} AND interested=1",
+        params,
+    ).fetchone()
+    con.close()
+    journals = [{
+        "key": r[0] or "",
+        "title": (_clean_journal_name(r[1]) or "未标注期刊") if r[1] else "未标注期刊",
+        "total": int(r[2] or 0),
+        "read": int(r[3] or 0),
+    } for r in rows]
+    return {
+        "interested": {
+            "key": "",
+            "title": "感兴趣",
+            "total": int(interested_row[0] or 0),
+            "read": int(interested_row[1] or 0),
+        },
+        "journals": journals,
     }
 
 

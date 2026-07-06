@@ -21,7 +21,7 @@
     }
   },
   "schedule": {
-    "rss_discovery_interval_minutes": 10,
+    "rss_discovery_interval_minutes": 60,
     "rss_interval_minutes": 30,
     "pdf_interval_minutes": 5,
     "enabled": true

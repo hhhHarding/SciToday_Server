@@ -482,7 +482,7 @@ async function renderSettings() {
     <div class="panel">
       <h2>调度</h2>
       <div class="grid">
-        <label>RSS discovery 间隔(分)<input id="rssDiscoveryInterval" type="number" value="${h((cfg.schedule || {}).rss_discovery_interval_minutes || 30)}"></label>
+        <label>RSS discovery 间隔(分)<input id="rssDiscoveryInterval" type="number" min="15" value="${h((cfg.schedule || {}).rss_discovery_interval_minutes || 60)}"></label>
         <label>RSS publish 间隔(分)<input id="rssInterval" type="number" value="${h((cfg.schedule || {}).rss_interval_minutes || 30)}"></label>
         <label>PDF 间隔(分)<input id="pdfInterval" type="number" value="${h((cfg.schedule || {}).pdf_interval_minutes || 5)}"></label>
         <label>启用<select id="scheduleEnabled"><option value="true">true</option><option value="false">false</option></select></label>
@@ -669,11 +669,39 @@ async function renderMonitor() {
     ${collapsibleCard(
       "monitor-feed-health",
       "RSS 源健康",
-      `<div class="tableWrap"><table><thead><tr><th>源</th><th>状态</th><th>最近成功</th><th>错误</th></tr></thead><tbody>${feeds.map(f => `<tr><td>${h(f.title)}</td><td class="${f.status === "ok" ? "ok" : "bad"}">${h(f.status)}</td><td>${h(f.last_ok)}</td><td>${h(f.error)}</td></tr>`).join("")}</tbody></table></div>`,
+      `<div class="tableWrap"><table><thead><tr><th>源</th><th>状态</th><th>HTTP</th><th>最近成功</th><th>下次抓取 / 封禁至</th><th>错误</th><th>操作</th></tr></thead><tbody>${feeds.map(f => `<tr>
+        <td>${h(f.title)}<div class="label">${h(f.host || "")}</div></td>
+        <td class="${f.status === "ok" ? "ok" : f.status === "blocked" ? "warn" : "bad"}">${h(f.status)}${f.consecutive_failures ? ` (${h(f.consecutive_failures)})` : ""}</td>
+        <td>${h(f.http_status || "-")}</td>
+        <td>${h(f.last_ok || "-")}</td>
+        <td>${h(f.blocked_until || f.next_fetch || "-")}</td>
+        <td>${h(f.error_category || "")}<div class="label">${h(f.error || "")}</div></td>
+        <td><button class="rssProbe" data-url="${h(f.url)}" ${f.probe_allowed === false ? "disabled" : ""}>单次探测</button></td>
+      </tr>`).join("")}</tbody></table></div>`,
       {meta: `${feeds.length} 个源`}
     )}
     ${collapsibleCard("monitor-events", "事件", renderEvents(events), {meta: `${events.length} 条`})}
   `;
+  document.querySelectorAll(".rssProbe").forEach(button => {
+    button.addEventListener("click", async () => {
+      const url = button.dataset.url;
+      if (!confirm(`将对该源发送一次请求并绕过当前抓取冷却；同域名一小时内只能执行一次。\\n\\n${url}`)) return;
+      button.disabled = true;
+      try {
+        const result = await api("/api/admin/rss-probe", {
+          method: "POST",
+          body: JSON.stringify({url, override_cooldown: true}),
+        });
+        alert(result.ok
+          ? `探测成功：HTTP ${result.upstream_status || "-"}，新增 ${result.new_items || 0} 篇`
+          : `探测完成：${result.category || result.error || "未知错误"}，HTTP ${result.upstream_status || "-"}`);
+        await renderMonitor();
+      } catch (error) {
+        alert(`探测失败：${error.message}`);
+        button.disabled = false;
+      }
+    });
+  });
 }
 
 async function renderLogs() {
@@ -909,7 +937,7 @@ document.addEventListener("click", async e => {
     }
     const body = {
       schedule: {
-        rss_discovery_interval_minutes: Number(document.getElementById("rssDiscoveryInterval").value || 30),
+        rss_discovery_interval_minutes: Number(document.getElementById("rssDiscoveryInterval").value || 60),
         rss_interval_minutes: Number(document.getElementById("rssInterval").value || 30),
         pdf_interval_minutes: Number(document.getElementById("pdfInterval").value || 5),
         enabled: document.getElementById("scheduleEnabled").value === "true",

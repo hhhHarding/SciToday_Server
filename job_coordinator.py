@@ -260,10 +260,11 @@ class TaskCoordinator:
                 discovery_minutes = self._positive_minutes(
                     schedule.get(
                         "rss_discovery_interval_minutes",
-                        publish_minutes,
+                        60,
                     ),
-                    publish_minutes,
+                    60,
                 )
+                discovery_minutes = max(15, discovery_minutes)
                 pdf_minutes = self._positive_minutes(
                     schedule.get("pdf_interval_minutes", 5),
                     5,
@@ -363,10 +364,20 @@ class TaskCoordinator:
                     },
                 )
             finished_at = int(self._clock())
+            suggested_next_run = (
+                int(result.get("next_run_at") or 0)
+                if request.job_type == "shared_ingest"
+                and isinstance(result, dict)
+                else 0
+            )
             next_run_at = (
-                finished_at + request.interval_seconds
-                if request.scheduled and request.interval_seconds
-                else None
+                max(finished_at + 60, suggested_next_run)
+                if suggested_next_run
+                else (
+                    finished_at + request.interval_seconds
+                    if request.scheduled and request.interval_seconds
+                    else None
+                )
             )
             self.registry.record_job_finished(
                 request.tenant_id,
@@ -400,7 +411,9 @@ class TaskCoordinator:
                 logger.exception("写入任务失败事件时发生异常")
             finished_at = int(self._clock())
             next_run_at = (
-                finished_at + request.interval_seconds
+                finished_at + 15 * 60
+                if request.job_type == "shared_ingest"
+                else finished_at + request.interval_seconds
                 if request.scheduled and request.interval_seconds
                 else None
             )

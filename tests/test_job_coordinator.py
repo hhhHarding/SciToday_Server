@@ -210,7 +210,7 @@ class TaskCoordinatorTests(unittest.TestCase):
         for legacy in ("rss", "rss_discovery", "rss_publish"):
             self.assertFalse(alpha_states[legacy]["enabled"])
 
-        coordinator.scan_once(now=2000)
+        coordinator.scan_once(now=5000)
         # owner:3 + t_alpha:2 + t_beta:2 = 7 个到期任务。
         self.assertTrue(self.wait_until(lambda: len(observed) == 7))
         self.assertEqual(
@@ -220,6 +220,44 @@ class TaskCoordinatorTests(unittest.TestCase):
         self.assertTrue(
             all(thread_name.startswith("rssai-job") for _, thread_name in observed)
         )
+
+    def test_shared_ingest_result_controls_next_run_time(self):
+        self.registry.ensure_job_schedule(
+            "owner",
+            "shared_ingest",
+            interval_seconds=3600,
+            enabled=True,
+            now=0,
+        )
+        coordinator = self.coordinator(
+            clock=lambda: 1000,
+            handlers={
+                "shared_ingest": lambda progress_callback=None: {
+                    "next_run_at": 5000
+                }
+            },
+        )
+        result = coordinator.submit(
+            "owner",
+            "shared_ingest",
+            trigger_source="scheduler",
+            scheduled=True,
+            interval_seconds=3600,
+        )
+        self.assertTrue(result.accepted)
+        self.assertTrue(
+            self.wait_until(
+                lambda: {
+                    row["job_type"]: row
+                    for row in self.registry.get_job_states("owner")
+                }["shared_ingest"]["status"] == "succeeded"
+            )
+        )
+        row = {
+            item["job_type"]: item
+            for item in self.registry.get_job_states("owner")
+        }["shared_ingest"]
+        self.assertEqual(row["next_run_at"], 5000)
 
     def test_start_recovers_queued_and_running_records(self):
         self.registry.record_job_queued(
