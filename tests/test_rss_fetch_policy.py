@@ -14,6 +14,8 @@ from tenancy.registry import TenantRegistry
 
 FEED_A = "https://feeds.example/a.xml"
 FEED_B = "https://feeds.example/b.xml"
+WILEY_A = "https://onlinelibrary.wiley.com/rss/journal/a"
+WILEY_B = "https://agupubs.onlinelibrary.wiley.com/rss/journal/b"
 
 
 class _Response:
@@ -175,6 +177,71 @@ class RssFetchPolicyTests(unittest.TestCase):
             tasks._fetch_exception_category(requests.exceptions.SSLError("tls")),
             "tls_error",
         )
+        self.assertEqual(
+            tasks._feed_failure_policy(
+                "access_denied",
+                1,
+                host="onlinelibrary.wiley.com",
+            ),
+            (24 * 60 * 60, False),
+        )
+        self.assertEqual(tasks._wiley_403_delay(10), 7 * 24 * 60 * 60)
+
+    def test_wiley_403_blocks_all_wiley_hosts_and_probe_for_24_hours(self):
+        self._set_owner_feeds([WILEY_A, WILEY_B])
+        with tenant_context("owner"):
+            feeds = {WILEY_A: "Wiley A", WILEY_B: "Wiley B"}
+            tasks.sync_shared_feed_fetch_state(feeds, now=1000)
+            denied = tasks.FeedFetchResult(
+                feed={"title": "Wiley A", "url": WILEY_A},
+                category="access_denied",
+                error="HTTP 403",
+                http_status=403,
+            )
+            tasks._record_shared_fetch_result(denied, now=1000)
+            con = tasks._shared_content_db()
+            publisher = con.execute(
+                """SELECT blocked_until_ts, access_failure_count
+                FROM publisher_fetch_state WHERE publisher='wiley'"""
+            ).fetchone()
+            host_rows = con.execute(
+                """SELECT host, blocked_until_ts FROM host_fetch_state
+                WHERE host LIKE '%wiley.com'"""
+            ).fetchall()
+            con.close()
+            self.assertEqual(publisher, (1000 + 24 * 60 * 60, 1))
+            self.assertEqual(len(host_rows), 2)
+            self.assertTrue(
+                all(row[1] == 1000 + 24 * 60 * 60 for row in host_rows)
+            )
+            self.assertEqual(
+                tasks._claim_due_shared_feeds(feeds, now=2000),
+                [],
+            )
+            with patch.object(tasks, "_fetch_host_group") as fetch:
+                probe = tasks.probe_shared_rss_feed(
+                    WILEY_A,
+                    override_cooldown=True,
+                    now=2000,
+                )
+            self.assertEqual(probe["error"], "wiley_publisher_cooldown")
+            fetch.assert_not_called()
+
+            second = tasks.FeedFetchResult(
+                feed={"title": "Wiley B", "url": WILEY_B},
+                category="access_denied",
+                error="HTTP 403",
+                http_status=403,
+            )
+            second_at = 1000 + 24 * 60 * 60
+            tasks._record_shared_fetch_result(second, now=second_at)
+            con = tasks._shared_content_db()
+            publisher = con.execute(
+                """SELECT blocked_until_ts, access_failure_count
+                FROM publisher_fetch_state WHERE publisher='wiley'"""
+            ).fetchone()
+            con.close()
+            self.assertEqual(publisher, (second_at + 48 * 60 * 60, 2))
 
     def test_success_interval_uses_hint_then_doubles_when_unchanged(self):
         with tenant_context("owner"):
@@ -221,6 +288,19 @@ class RssFetchPolicyTests(unittest.TestCase):
             row = self._state_row()
             self.assertEqual(row["error_category"], "access_denied")
             self.assertEqual(row["blocked_until_ts"], 1000 + 60 * 60)
+
+    def test_legacy_wiley_403_is_seeded_with_24_hour_cooldown(self):
+        self._set_owner_feeds([WILEY_A])
+        with tenant_context("owner"):
+            tasks.record_feed_health(
+                {"title": "Wiley A", "url": WILEY_A},
+                ok=False,
+                error="403 Client Error",
+            )
+            tasks.sync_shared_feed_fetch_state({WILEY_A: "Wiley A"}, now=1000)
+            row = self._state_row(WILEY_A)
+            self.assertEqual(row["error_category"], "access_denied")
+            self.assertEqual(row["blocked_until_ts"], 1000 + 24 * 60 * 60)
 
     def test_host_worker_stops_after_access_denied(self):
         states = [

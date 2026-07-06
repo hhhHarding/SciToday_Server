@@ -207,6 +207,19 @@ RSS_HOST_WORKERS = 4
 RSS_HOST_GAP_SECONDS = (5, 15)
 RSS_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 RSS_NOT_MODIFIED_STATUSES = frozenset({204, 304})
+WILEY_PUBLISHER_KEY = "wiley"
+WILEY_403_MIN_SECONDS = 24 * 60 * 60
+WILEY_403_MAX_SECONDS = 7 * 24 * 60 * 60
+
+
+def _is_wiley_rss_host(host):
+    normalized = str(host or "").strip().lower().rstrip(".")
+    return normalized == "wiley.com" or normalized.endswith(".wiley.com")
+
+
+def _wiley_403_delay(failures):
+    exponent = max(0, int(failures or 1) - 1)
+    return min(WILEY_403_MIN_SECONDS * (2 ** exponent), WILEY_403_MAX_SECONDS)
 
 
 @dataclass(slots=True)
@@ -1736,6 +1749,14 @@ def _migrate_shared_content_db(con):
         lease_until_ts INTEGER NOT NULL DEFAULT 0,
         updated_ts INTEGER NOT NULL DEFAULT 0
     )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS publisher_fetch_state(
+        publisher TEXT PRIMARY KEY,
+        blocked_until_ts INTEGER NOT NULL DEFAULT 0,
+        access_failure_count INTEGER NOT NULL DEFAULT 0,
+        last_http_status INTEGER NOT NULL DEFAULT 0,
+        last_error_ts INTEGER NOT NULL DEFAULT 0,
+        updated_ts INTEGER NOT NULL DEFAULT 0
+    )""")
     con.commit()
 
 
@@ -1909,6 +1930,12 @@ def get_feed_health():
         WHERE feed.active=1
         ORDER BY feed.title COLLATE NOCASE"""
     ).fetchall()
+    publisher_row = shared.execute(
+        """SELECT blocked_until_ts FROM publisher_fetch_state
+        WHERE publisher=?""",
+        (WILEY_PUBLISHER_KEY,),
+    ).fetchone()
+    wiley_blocked_until = int((publisher_row or (0,))[0] or 0)
     shared.close()
     if rows:
         now = int(time.time())
@@ -1916,7 +1943,11 @@ def get_feed_health():
         for row in rows:
             last_ok = int(row[3] or 0)
             last_checked = int(row[4] or 0)
-            blocked_until = max(int(row[10] or 0), int(row[14] or 0))
+            blocked_until = max(
+                int(row[10] or 0),
+                int(row[14] or 0),
+                wiley_blocked_until if _is_wiley_rss_host(row[2]) else 0,
+            )
             disabled = bool(row[11])
             if disabled:
                 status = "disabled"
@@ -3995,15 +4026,22 @@ def sync_shared_feed_fetch_state(feeds=None, now=None):
         host = (urlsplit(normalized).hostname or "").lower()
         if not host:
             continue
-        exists = con.execute(
-            "SELECT 1 FROM feed_fetch_state WHERE feed_url=?",
+        existing = con.execute(
+            """SELECT error_category, consecutive_failures, last_checked_ts
+            FROM feed_fetch_state WHERE feed_url=?""",
             (normalized,),
         ).fetchone()
-        if not exists:
+        if not existing:
             legacy_error = legacy_blocked.get(normalized, "")
-            # 迁移旧的 403 记录时只种入 1 小时冷却，让新的浏览器 UA 尽快重试，
-            # 而不是部署后整站沉默一整天。
-            blocked_until = now + 60 * 60 if legacy_error else 0
+            blocked_until = (
+                now + (
+                    WILEY_403_MIN_SECONDS
+                    if _is_wiley_rss_host(host)
+                    else 60 * 60
+                )
+                if legacy_error
+                else 0
+            )
             stagger = int(hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:8], 16) % (
                 15 * 60
             )
@@ -4040,6 +4078,75 @@ def sync_shared_feed_fetch_state(feeds=None, now=None):
             VALUES(?,?)""",
             (host, now),
         )
+        if _is_wiley_rss_host(host):
+            con.execute(
+                """INSERT OR IGNORE INTO publisher_fetch_state(publisher, updated_ts)
+                VALUES(?,?)""",
+                (WILEY_PUBLISHER_KEY, now),
+            )
+            state = con.execute(
+                """SELECT error_category, consecutive_failures, last_checked_ts
+                FROM feed_fetch_state WHERE feed_url=?""",
+                (normalized,),
+            ).fetchone()
+            if state and state[0] == "access_denied":
+                publisher = con.execute(
+                    """SELECT access_failure_count FROM publisher_fetch_state
+                    WHERE publisher=?""",
+                    (WILEY_PUBLISHER_KEY,),
+                ).fetchone()
+                failures = max(
+                    1,
+                    int(state[1] or 0),
+                    int((publisher or (0,))[0] or 0),
+                )
+                reference_ts = int(state[2] or 0) or now
+                required_until = reference_ts + _wiley_403_delay(failures)
+                if required_until > now:
+                    con.execute(
+                        """UPDATE feed_fetch_state SET
+                            next_fetch_ts=MAX(next_fetch_ts, ?),
+                            blocked_until_ts=MAX(blocked_until_ts, ?)
+                        WHERE feed_url=?""",
+                        (required_until, required_until, normalized),
+                    )
+                    con.execute(
+                        """UPDATE publisher_fetch_state SET
+                            blocked_until_ts=MAX(blocked_until_ts, ?),
+                            access_failure_count=MAX(access_failure_count, ?),
+                            last_http_status=403,
+                            updated_ts=?
+                        WHERE publisher=?""",
+                        (
+                            required_until,
+                            failures,
+                            now,
+                            WILEY_PUBLISHER_KEY,
+                        ),
+                    )
+    publisher_row = con.execute(
+        """SELECT blocked_until_ts, access_failure_count
+        FROM publisher_fetch_state WHERE publisher=?""",
+        (WILEY_PUBLISHER_KEY,),
+    ).fetchone()
+    if publisher_row and int(publisher_row[0] or 0) > now:
+        for (wiley_host,) in con.execute(
+            "SELECT host FROM host_fetch_state"
+        ).fetchall():
+            if _is_wiley_rss_host(wiley_host):
+                con.execute(
+                    """UPDATE host_fetch_state SET
+                        blocked_until_ts=MAX(blocked_until_ts, ?),
+                        access_failure_count=MAX(access_failure_count, ?),
+                        updated_ts=?
+                    WHERE host=?""",
+                    (
+                        int(publisher_row[0]),
+                        int(publisher_row[1] or 0),
+                        now,
+                        wiley_host,
+                    ),
+                )
     con.commit()
     con.close()
     return len(feeds)
@@ -4071,6 +4178,16 @@ def _claim_due_shared_feeds(feeds, now=None, force_url=None):
             if not row or (row["disabled"] and not force_url):
                 continue
             host = row["host"]
+            publisher_blocked_until = 0
+            if _is_wiley_rss_host(host):
+                publisher_row = con.execute(
+                    """SELECT blocked_until_ts FROM publisher_fetch_state
+                    WHERE publisher=?""",
+                    (WILEY_PUBLISHER_KEY,),
+                ).fetchone()
+                publisher_blocked_until = int(
+                    (publisher_row or (0,))[0] or 0
+                )
             if host in claimed_hosts:
                 host_ready = True
             else:
@@ -4079,6 +4196,7 @@ def _claim_due_shared_feeds(feeds, now=None, force_url=None):
                     host_ready = host_ready and max(
                         int(row["host_next_allowed_ts"] or 0),
                         int(row["host_blocked_until_ts"] or 0),
+                        publisher_blocked_until,
                     ) <= now
             feed_ready = int(row["lease_until_ts"] or 0) <= now
             if not force_url:
@@ -4125,9 +4243,11 @@ def _release_shared_host_lease(host, now=None):
     con.close()
 
 
-def _feed_failure_policy(category, failures, retry_after=0):
+def _feed_failure_policy(category, failures, retry_after=0, host=""):
     exponent = max(0, int(failures) - 1)
     if category == "access_denied":
+        if _is_wiley_rss_host(host):
+            return _wiley_403_delay(failures), False
         # 403 常由瞬时的 IP 信誉/突发流量触发，首次仅冷却 1 小时并指数回退，
         # 避免单次抖动就把 feed 锁死一整天；上限 24 小时。
         return min(60 * 60 * (2 ** exponent), 24 * 60 * 60), False
@@ -4230,12 +4350,21 @@ def _record_shared_fetch_result(
                 host,
             ),
         )
+        if _is_wiley_rss_host(host):
+            con.execute(
+                """UPDATE publisher_fetch_state SET
+                    blocked_until_ts=0, access_failure_count=0,
+                    last_http_status=?, updated_ts=?
+                WHERE publisher=?""",
+                (result.http_status, now, WILEY_PUBLISHER_KEY),
+            )
     else:
         failures = int(row["consecutive_failures"] or 0) + 1
         delay, disabled = _feed_failure_policy(
             result.category,
             failures,
             result.retry_after_seconds,
+            host,
         )
         blocked_until = now + delay
         disabled_reason = result.category if disabled else ""
@@ -4271,23 +4400,70 @@ def _record_shared_fetch_result(
         host_failures = int(host_row["access_failure_count"] or 0)
         host_blocked_until = int(host_row["blocked_until_ts"] or 0)
         if result.category == "access_denied":
-            other_denied = con.execute(
-                """SELECT 1 FROM feed_fetch_state
-                WHERE host=? AND feed_url<>? AND error_category='access_denied'
-                    AND last_checked_ts>=? LIMIT 1""",
-                (host, url, now - 24 * 60 * 60),
-            ).fetchone()
-            host_failures += 1
-            if other_denied:
-                # 同一 host 上出现第二个 403 才升级为 host 级冷却，但从 2 小时起步
-                # 指数回退（上限 24 小时），避免一次瞬时抖动冻结整个出版社一整天。
-                host_delay = min(
-                    2 * 60 * 60 * (2 ** max(0, host_failures - 2)),
-                    24 * 60 * 60,
+            if _is_wiley_rss_host(host):
+                publisher_row = con.execute(
+                    """SELECT access_failure_count, blocked_until_ts
+                    FROM publisher_fetch_state WHERE publisher=?""",
+                    (WILEY_PUBLISHER_KEY,),
+                ).fetchone()
+                publisher_failures = int((publisher_row or (0, 0))[0] or 0) + 1
+                host_failures = publisher_failures
+                host_delay = _wiley_403_delay(publisher_failures)
+                host_blocked_until = max(host_blocked_until, now + host_delay)
+                con.execute(
+                    """INSERT INTO publisher_fetch_state(
+                        publisher, blocked_until_ts, access_failure_count,
+                        last_http_status, last_error_ts, updated_ts
+                    ) VALUES(?,?,?,?,?,?)
+                    ON CONFLICT(publisher) DO UPDATE SET
+                        blocked_until_ts=excluded.blocked_until_ts,
+                        access_failure_count=excluded.access_failure_count,
+                        last_http_status=excluded.last_http_status,
+                        last_error_ts=excluded.last_error_ts,
+                        updated_ts=excluded.updated_ts""",
+                    (
+                        WILEY_PUBLISHER_KEY,
+                        host_blocked_until,
+                        publisher_failures,
+                        result.http_status,
+                        now,
+                        now,
+                    ),
                 )
+                for (wiley_host,) in con.execute(
+                    "SELECT host FROM host_fetch_state"
+                ).fetchall():
+                    if _is_wiley_rss_host(wiley_host):
+                        con.execute(
+                            """UPDATE host_fetch_state SET
+                                blocked_until_ts=MAX(blocked_until_ts, ?),
+                                access_failure_count=MAX(access_failure_count, ?),
+                                updated_ts=?
+                            WHERE host=?""",
+                            (
+                                host_blocked_until,
+                                publisher_failures,
+                                now,
+                                wiley_host,
+                            ),
+                        )
             else:
-                host_delay = 60 * 60
-            host_blocked_until = max(host_blocked_until, now + host_delay)
+                other_denied = con.execute(
+                    """SELECT 1 FROM feed_fetch_state
+                    WHERE host=? AND feed_url<>? AND error_category='access_denied'
+                        AND last_checked_ts>=? LIMIT 1""",
+                    (host, url, now - 24 * 60 * 60),
+                ).fetchone()
+                host_failures += 1
+                if other_denied:
+                    # 非 Wiley host 延续较短退避；Wiley 使用上面的出版社级策略。
+                    host_delay = min(
+                        2 * 60 * 60 * (2 ** max(0, host_failures - 2)),
+                        24 * 60 * 60,
+                    )
+                else:
+                    host_delay = 60 * 60
+                host_blocked_until = max(host_blocked_until, now + host_delay)
         elif result.category == "rate_limited":
             host_failures += 1
             host_delay = max(
@@ -4328,6 +4504,12 @@ def _record_shared_fetch_result(
 def _next_shared_fetch_ts(feeds, now=None):
     now = int(time.time() if now is None else now)
     con = _shared_content_db()
+    publisher_row = con.execute(
+        """SELECT blocked_until_ts FROM publisher_fetch_state
+        WHERE publisher=?""",
+        (WILEY_PUBLISHER_KEY,),
+    ).fetchone()
+    wiley_blocked_until = int((publisher_row or (0,))[0] or 0)
     values = []
     for url in feeds:
         row = con.execute(
@@ -4339,7 +4521,14 @@ def _next_shared_fetch_ts(feeds, now=None):
             (_normalize_feed_url(url),),
         ).fetchone()
         if row and not row[2]:
-            values.append(max(int(row[0] or 0), int(row[1] or 0), int(row[3] or 0), int(row[4] or 0)))
+            host = (urlsplit(_normalize_feed_url(url)).hostname or "").lower()
+            values.append(max(
+                int(row[0] or 0),
+                int(row[1] or 0),
+                int(row[3] or 0),
+                int(row[4] or 0),
+                wiley_blocked_until if _is_wiley_rss_host(host) else 0,
+            ))
     con.close()
     return max(now + 60, min(values)) if values else now + RSS_DEFAULT_INTERVAL_SECONDS
 
@@ -4518,6 +4707,12 @@ def probe_shared_rss_feed(url, *, override_cooldown=False, now=None):
         WHERE feed.feed_url=?""",
         (normalized,),
     ).fetchone()
+    publisher_row = con.execute(
+        """SELECT blocked_until_ts FROM publisher_fetch_state
+        WHERE publisher=?""",
+        (WILEY_PUBLISHER_KEY,),
+    ).fetchone()
+    publisher_blocked_until = int((publisher_row or (0,))[0] or 0)
     con.close()
     if not row:
         return {"ok": False, "error": "state_missing", "status_code": 500}
@@ -4532,11 +4727,22 @@ def probe_shared_rss_feed(url, *, override_cooldown=False, now=None):
             "status_code": 429,
             "retry_after": probe_allowed_at - now,
         }
+    if (
+        _is_wiley_rss_host(row["host"])
+        and publisher_blocked_until > now
+    ):
+        return {
+            "ok": False,
+            "error": "wiley_publisher_cooldown",
+            "status_code": 409,
+            "retry_after": publisher_blocked_until - now,
+        }
     ready_at = max(
         int(row["next_fetch_ts"] or 0),
         int(row["blocked_until_ts"] or 0),
         int(row["next_allowed_ts"] or 0),
         int(row["host_blocked_until_ts"] or 0),
+        publisher_blocked_until if _is_wiley_rss_host(row["host"]) else 0,
     )
     if ready_at > now and not override_cooldown:
         return {
