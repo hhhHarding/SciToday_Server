@@ -211,6 +211,154 @@ RSS_NOT_MODIFIED_STATUSES = frozenset({204, 304})
 WILEY_PUBLISHER_KEY = "wiley"
 WILEY_403_MIN_SECONDS = 24 * 60 * 60
 WILEY_403_MAX_SECONDS = 7 * 24 * 60 * 60
+RSS_FETCH_CONFIG_DEFAULTS = {
+    "rss_min_interval_minutes": RSS_MIN_INTERVAL_SECONDS // 60,
+    "rss_default_interval_minutes": RSS_DEFAULT_INTERVAL_SECONDS // 60,
+    "rss_unchanged_max_interval_minutes": RSS_UNCHANGED_MAX_INTERVAL_SECONDS // 60,
+    "rss_max_interval_minutes": RSS_MAX_INTERVAL_SECONDS // 60,
+    "rss_feed_lease_minutes": RSS_FEED_LEASE_SECONDS // 60,
+    "rss_probe_cooldown_minutes": RSS_PROBE_COOLDOWN_SECONDS // 60,
+    "rss_host_workers": RSS_HOST_WORKERS,
+    "rss_host_gap_min_seconds": RSS_HOST_GAP_SECONDS[0],
+    "rss_host_gap_max_seconds": RSS_HOST_GAP_SECONDS[1],
+    "rss_access_denied_cooldown_minutes": 60,
+    "rss_access_denied_max_cooldown_minutes": 24 * 60,
+    "rss_rate_limited_base_cooldown_minutes": 6 * 60,
+    "rss_rate_limited_max_cooldown_minutes": 7 * 24 * 60,
+    "rss_not_found_base_cooldown_minutes": 24 * 60,
+    "rss_not_found_max_cooldown_minutes": 7 * 24 * 60,
+    "rss_not_found_disable_failures": 3,
+    "rss_client_error_base_cooldown_minutes": 24 * 60,
+    "rss_client_error_max_cooldown_minutes": 7 * 24 * 60,
+    "rss_client_error_disable_failures": 3,
+    "rss_gone_cooldown_minutes": 7 * 24 * 60,
+    "rss_unsafe_tls_cooldown_minutes": 7 * 24 * 60,
+    "rss_invalid_feed_base_cooldown_minutes": 6 * 60,
+    "rss_invalid_feed_max_cooldown_minutes": 24 * 60,
+    "rss_transient_base_cooldown_minutes": 15,
+    "rss_transient_max_cooldown_minutes": 6 * 60,
+    "rss_wiley_403_min_cooldown_minutes": WILEY_403_MIN_SECONDS // 60,
+    "rss_wiley_403_max_cooldown_minutes": WILEY_403_MAX_SECONDS // 60,
+}
+
+
+def _bounded_number(raw, default, minimum, maximum, *, integer=True):
+    if isinstance(raw, bool):
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    value = max(float(minimum), min(value, float(maximum)))
+    return int(round(value)) if integer else value
+
+
+def validate_rss_fetch_settings(value):
+    raw = value or {}
+    if not isinstance(raw, dict):
+        raw = {}
+    defaults = RSS_FETCH_CONFIG_DEFAULTS
+    result = {}
+    minute_keys = {
+        "rss_min_interval_minutes": (1, 24 * 60),
+        "rss_default_interval_minutes": (1, 7 * 24 * 60),
+        "rss_unchanged_max_interval_minutes": (1, 30 * 24 * 60),
+        "rss_max_interval_minutes": (1, 30 * 24 * 60),
+        "rss_feed_lease_minutes": (1, 24 * 60),
+        "rss_probe_cooldown_minutes": (0, 24 * 60),
+        "rss_access_denied_cooldown_minutes": (1, 30 * 24 * 60),
+        "rss_access_denied_max_cooldown_minutes": (1, 30 * 24 * 60),
+        "rss_rate_limited_base_cooldown_minutes": (1, 30 * 24 * 60),
+        "rss_rate_limited_max_cooldown_minutes": (1, 60 * 24 * 60),
+        "rss_not_found_base_cooldown_minutes": (1, 30 * 24 * 60),
+        "rss_not_found_max_cooldown_minutes": (1, 60 * 24 * 60),
+        "rss_client_error_base_cooldown_minutes": (1, 30 * 24 * 60),
+        "rss_client_error_max_cooldown_minutes": (1, 60 * 24 * 60),
+        "rss_gone_cooldown_minutes": (1, 60 * 24 * 60),
+        "rss_unsafe_tls_cooldown_minutes": (1, 60 * 24 * 60),
+        "rss_invalid_feed_base_cooldown_minutes": (1, 30 * 24 * 60),
+        "rss_invalid_feed_max_cooldown_minutes": (1, 60 * 24 * 60),
+        "rss_transient_base_cooldown_minutes": (1, 24 * 60),
+        "rss_transient_max_cooldown_minutes": (1, 30 * 24 * 60),
+        "rss_wiley_403_min_cooldown_minutes": (1, 60 * 24 * 60),
+        "rss_wiley_403_max_cooldown_minutes": (1, 90 * 24 * 60),
+    }
+    for key, (minimum, maximum) in minute_keys.items():
+        result[key] = _bounded_number(raw.get(key), defaults[key], minimum, maximum)
+    result["rss_host_workers"] = _bounded_number(
+        raw.get("rss_host_workers"), defaults["rss_host_workers"], 1, 32
+    )
+    result["rss_host_gap_min_seconds"] = _bounded_number(
+        raw.get("rss_host_gap_min_seconds"), defaults["rss_host_gap_min_seconds"], 0, 3600
+    )
+    result["rss_host_gap_max_seconds"] = _bounded_number(
+        raw.get("rss_host_gap_max_seconds"), defaults["rss_host_gap_max_seconds"], 0, 3600
+    )
+    result["rss_not_found_disable_failures"] = _bounded_number(
+        raw.get("rss_not_found_disable_failures"), defaults["rss_not_found_disable_failures"], 1, 20
+    )
+    result["rss_client_error_disable_failures"] = _bounded_number(
+        raw.get("rss_client_error_disable_failures"), defaults["rss_client_error_disable_failures"], 1, 20
+    )
+    result["rss_max_interval_minutes"] = max(
+        result["rss_min_interval_minutes"], result["rss_max_interval_minutes"]
+    )
+    result["rss_default_interval_minutes"] = max(
+        result["rss_min_interval_minutes"],
+        min(result["rss_default_interval_minutes"], result["rss_max_interval_minutes"]),
+    )
+    result["rss_unchanged_max_interval_minutes"] = max(
+        result["rss_default_interval_minutes"],
+        min(result["rss_unchanged_max_interval_minutes"], result["rss_max_interval_minutes"]),
+    )
+    for shorter, longer in (
+        ("rss_access_denied_cooldown_minutes", "rss_access_denied_max_cooldown_minutes"),
+        ("rss_rate_limited_base_cooldown_minutes", "rss_rate_limited_max_cooldown_minutes"),
+        ("rss_not_found_base_cooldown_minutes", "rss_not_found_max_cooldown_minutes"),
+        ("rss_client_error_base_cooldown_minutes", "rss_client_error_max_cooldown_minutes"),
+        ("rss_invalid_feed_base_cooldown_minutes", "rss_invalid_feed_max_cooldown_minutes"),
+        ("rss_transient_base_cooldown_minutes", "rss_transient_max_cooldown_minutes"),
+        ("rss_wiley_403_min_cooldown_minutes", "rss_wiley_403_max_cooldown_minutes"),
+    ):
+        result[longer] = max(result[shorter], result[longer])
+    result["rss_host_gap_max_seconds"] = max(
+        result["rss_host_gap_min_seconds"], result["rss_host_gap_max_seconds"]
+    )
+    return result
+
+
+def _rss_fetch_config(config=None):
+    cfg = config if config is not None else load_config()
+    values = validate_rss_fetch_settings((cfg.get("rss") or {}))
+    return {
+        **values,
+        "min_interval_seconds": values["rss_min_interval_minutes"] * 60,
+        "default_interval_seconds": values["rss_default_interval_minutes"] * 60,
+        "unchanged_max_interval_seconds": values["rss_unchanged_max_interval_minutes"] * 60,
+        "max_interval_seconds": values["rss_max_interval_minutes"] * 60,
+        "feed_lease_seconds": values["rss_feed_lease_minutes"] * 60,
+        "probe_cooldown_seconds": values["rss_probe_cooldown_minutes"] * 60,
+        "host_gap_seconds": (
+            values["rss_host_gap_min_seconds"],
+            values["rss_host_gap_max_seconds"],
+        ),
+        "wiley_403_min_seconds": values["rss_wiley_403_min_cooldown_minutes"] * 60,
+        "wiley_403_max_seconds": values["rss_wiley_403_max_cooldown_minutes"] * 60,
+        "access_denied_cooldown_seconds": values["rss_access_denied_cooldown_minutes"] * 60,
+        "access_denied_max_cooldown_seconds": values["rss_access_denied_max_cooldown_minutes"] * 60,
+        "rate_limited_base_cooldown_seconds": values["rss_rate_limited_base_cooldown_minutes"] * 60,
+        "rate_limited_max_cooldown_seconds": values["rss_rate_limited_max_cooldown_minutes"] * 60,
+        "not_found_base_cooldown_seconds": values["rss_not_found_base_cooldown_minutes"] * 60,
+        "not_found_max_cooldown_seconds": values["rss_not_found_max_cooldown_minutes"] * 60,
+        "client_error_base_cooldown_seconds": values["rss_client_error_base_cooldown_minutes"] * 60,
+        "client_error_max_cooldown_seconds": values["rss_client_error_max_cooldown_minutes"] * 60,
+        "gone_cooldown_seconds": values["rss_gone_cooldown_minutes"] * 60,
+        "unsafe_tls_cooldown_seconds": values["rss_unsafe_tls_cooldown_minutes"] * 60,
+        "invalid_feed_base_cooldown_seconds": values["rss_invalid_feed_base_cooldown_minutes"] * 60,
+        "invalid_feed_max_cooldown_seconds": values["rss_invalid_feed_max_cooldown_minutes"] * 60,
+        "transient_base_cooldown_seconds": values["rss_transient_base_cooldown_minutes"] * 60,
+        "transient_max_cooldown_seconds": values["rss_transient_max_cooldown_minutes"] * 60,
+    }
 
 
 def _is_wiley_rss_host(host):
@@ -218,9 +366,13 @@ def _is_wiley_rss_host(host):
     return normalized == "wiley.com" or normalized.endswith(".wiley.com")
 
 
-def _wiley_403_delay(failures):
+def _wiley_403_delay(failures, config=None):
+    policy = _rss_fetch_config(config)
     exponent = max(0, int(failures or 1) - 1)
-    return min(WILEY_403_MIN_SECONDS * (2 ** exponent), WILEY_403_MAX_SECONDS)
+    return min(
+        policy["wiley_403_min_seconds"] * (2 ** exponent),
+        policy["wiley_403_max_seconds"],
+    )
 
 
 @dataclass(slots=True)
@@ -1331,6 +1483,31 @@ def add_feed_to_opml(path, title, url):
     tree.write(path, encoding="utf-8", xml_declaration=True)
 
 
+def update_feed_in_opml(path, old_url, title, url):
+    tree = _safe_xml_parse(path)
+    root = tree.getroot()
+    old_normalized = _normalize_feed_url(old_url)
+    new_normalized = _normalize_feed_url(url)
+    for outline in root.iter("outline"):
+        feed_url = outline.attrib.get("xmlUrl") or outline.attrib.get("xmlurl") or ""
+        if _normalize_feed_url(feed_url) == new_normalized and new_normalized != old_normalized:
+            raise ValueError("RSS URL 已存在")
+
+    for outline in root.iter("outline"):
+        feed_url = outline.attrib.get("xmlUrl") or outline.attrib.get("xmlurl") or ""
+        if _normalize_feed_url(feed_url) != old_normalized:
+            continue
+        outline.set("type", "rss")
+        outline.set("text", title)
+        outline.set("title", title)
+        outline.set("xmlUrl", new_normalized)
+        if "xmlurl" in outline.attrib:
+            outline.set("xmlurl", new_normalized)
+        tree.write(path, encoding="utf-8", xml_declaration=True)
+        return True
+    return False
+
+
 def remove_feed_from_opml(path, url):
     tree = _safe_xml_parse(path)
     root = tree.getroot()
@@ -1941,6 +2118,7 @@ def get_feed_health():
     shared.close()
     if rows:
         now = int(time.time())
+        policy = _rss_fetch_config()
         result = []
         for row in rows:
             last_ok = int(row[3] or 0)
@@ -1961,7 +2139,7 @@ def get_feed_health():
                 status = "error"
             last_probe = int(row[13] or 0)
             probe_allowed_at = (
-                last_probe + RSS_PROBE_COOLDOWN_SECONDS if last_probe else 0
+                last_probe + policy["probe_cooldown_seconds"] if last_probe else 0
             )
             result.append({
                 "title": row[0] or "",
@@ -3438,10 +3616,11 @@ def _entry_published_ts(entry):
     return 0
 
 
-def _clamp_rss_interval(seconds):
+def _clamp_rss_interval(seconds, config=None):
+    policy = _rss_fetch_config(config)
     return max(
-        RSS_MIN_INTERVAL_SECONDS,
-        min(int(seconds or RSS_DEFAULT_INTERVAL_SECONDS), RSS_MAX_INTERVAL_SECONDS),
+        policy["min_interval_seconds"],
+        min(int(seconds or policy["default_interval_seconds"]), policy["max_interval_seconds"]),
     )
 
 
@@ -4066,16 +4245,17 @@ def _active_tenant_feed_union():
 
 def _rss_discovery_interval_seconds(config=None):
     cfg = config or load_config()
+    policy = _rss_fetch_config(cfg)
     try:
         minutes = int(
             (cfg.get("schedule") or {}).get(
                 "rss_discovery_interval_minutes",
-                RSS_DEFAULT_INTERVAL_SECONDS // 60,
+                policy["default_interval_seconds"] // 60,
             )
         )
     except (TypeError, ValueError):
-        minutes = RSS_DEFAULT_INTERVAL_SECONDS // 60
-    return _clamp_rss_interval(max(15, minutes) * 60)
+        minutes = policy["default_interval_seconds"] // 60
+    return _clamp_rss_interval(max(15, minutes) * 60, cfg)
 
 
 def _legacy_blocked_feed_urls():
@@ -4099,6 +4279,7 @@ def sync_shared_feed_fetch_state(feeds=None, now=None):
 
     feeds = _active_tenant_feed_union() if feeds is None else dict(feeds)
     now = int(time.time() if now is None else now)
+    policy = _rss_fetch_config()
     legacy_blocked = _legacy_blocked_feed_urls()
     con = _shared_content_db()
     con.execute("UPDATE feed_fetch_state SET active=0")
@@ -4116,9 +4297,9 @@ def sync_shared_feed_fetch_state(feeds=None, now=None):
             legacy_error = legacy_blocked.get(normalized, "")
             blocked_until = (
                 now + (
-                    WILEY_403_MIN_SECONDS
+                    policy["wiley_403_min_seconds"]
                     if _is_wiley_rss_host(host)
-                    else 60 * 60
+                    else policy["access_denied_cooldown_seconds"]
                 )
                 if legacy_error
                 else 0
@@ -4140,7 +4321,7 @@ def sync_shared_feed_fetch_state(feeds=None, now=None):
                     "access_denied" if legacy_error else "",
                     legacy_error[:500],
                     1 if legacy_error else 0,
-                    RSS_DEFAULT_INTERVAL_SECONDS,
+                    policy["default_interval_seconds"],
                     next_fetch,
                     blocked_until,
                     1,
@@ -4236,6 +4417,7 @@ def sync_shared_feed_fetch_state(feeds=None, now=None):
 def _claim_due_shared_feeds(feeds, now=None, force_url=None):
     now = int(time.time() if now is None else now)
     sync_shared_feed_fetch_state(feeds, now=now)
+    policy = _rss_fetch_config()
     force_url = _normalize_feed_url(force_url) if force_url else ""
     con = _shared_content_db()
     con.row_factory = sqlite3.Row
@@ -4290,12 +4472,12 @@ def _claim_due_shared_feeds(feeds, now=None, force_url=None):
             if host not in claimed_hosts:
                 con.execute(
                     "UPDATE host_fetch_state SET lease_until_ts=?, updated_ts=? WHERE host=?",
-                    (now + RSS_FEED_LEASE_SECONDS, now, host),
+                    (now + policy["feed_lease_seconds"], now, host),
                 )
                 claimed_hosts.add(host)
             con.execute(
                 "UPDATE feed_fetch_state SET lease_until_ts=?, updated_ts=? WHERE feed_url=?",
-                (now + RSS_FEED_LEASE_SECONDS, now, normalized),
+                (now + policy["feed_lease_seconds"], now, normalized),
             )
             state = dict(row)
             state["title"] = title or state.get("title") or normalized
@@ -4325,37 +4507,58 @@ def _release_shared_host_lease(host, now=None):
 
 
 def _feed_failure_policy(category, failures, retry_after=0, host=""):
+    policy = _rss_fetch_config()
     exponent = max(0, int(failures) - 1)
     if category == "access_denied":
         if _is_wiley_rss_host(host):
             return _wiley_403_delay(failures), False
         # 403 常由瞬时的 IP 信誉/突发流量触发，首次仅冷却 1 小时并指数回退，
         # 避免单次抖动就把 feed 锁死一整天；上限 24 小时。
-        return min(60 * 60 * (2 ** exponent), 24 * 60 * 60), False
+        return min(
+            policy["access_denied_cooldown_seconds"] * (2 ** exponent),
+            policy["access_denied_max_cooldown_seconds"],
+        ), False
     if category == "rate_limited":
-        delay = max(int(retry_after or 0), 6 * 60 * 60 * (2 ** exponent))
-        return min(delay, 7 * 24 * 60 * 60), False
+        delay = max(
+            int(retry_after or 0),
+            policy["rate_limited_base_cooldown_seconds"] * (2 ** exponent),
+        )
+        return min(delay, policy["rate_limited_max_cooldown_seconds"]), False
     if category == "not_found":
-        return min(24 * 60 * 60 * (2 ** exponent), 7 * 24 * 60 * 60), failures >= 3
+        return min(
+            policy["not_found_base_cooldown_seconds"] * (2 ** exponent),
+            policy["not_found_max_cooldown_seconds"],
+        ), failures >= policy["rss_not_found_disable_failures"]
     if category == "gone":
-        return 7 * 24 * 60 * 60, True
+        return policy["gone_cooldown_seconds"], True
     if category == "client_error":
-        return min(24 * 60 * 60 * (2 ** exponent), 7 * 24 * 60 * 60), failures >= 3
+        return min(
+            policy["client_error_base_cooldown_seconds"] * (2 ** exponent),
+            policy["client_error_max_cooldown_seconds"],
+        ), failures >= policy["rss_client_error_disable_failures"]
     if category in {"unsafe_url", "tls_error"}:
-        return 7 * 24 * 60 * 60, True
+        return policy["unsafe_tls_cooldown_seconds"], True
     if category in {"invalid_feed", "redirect_error"}:
-        return min(6 * 60 * 60 * (2 ** exponent), 24 * 60 * 60), False
-    return min(15 * 60 * (2 ** exponent), 6 * 60 * 60), False
+        return min(
+            policy["invalid_feed_base_cooldown_seconds"] * (2 ** exponent),
+            policy["invalid_feed_max_cooldown_seconds"],
+        ), False
+    return min(
+        policy["transient_base_cooldown_seconds"] * (2 ** exponent),
+        policy["transient_max_cooldown_seconds"],
+    ), False
 
 
 def _record_shared_fetch_result(
     result,
     *,
     new_count=0,
-    fallback_interval=RSS_DEFAULT_INTERVAL_SECONDS,
+    fallback_interval=None,
     now=None,
 ):
     now = int(time.time() if now is None else now)
+    policy = _rss_fetch_config()
+    fallback_interval = int(fallback_interval or policy["default_interval_seconds"])
     url = _normalize_feed_url(result.feed.get("url", ""))
     host = (urlsplit(url).hostname or "").lower()
     con = _shared_content_db()
@@ -4381,12 +4584,12 @@ def _record_shared_fetch_result(
         else:
             interval = max(
                 base_interval,
-                min(previous_interval * 2, RSS_UNCHANGED_MAX_INTERVAL_SECONDS),
+                min(previous_interval * 2, policy["unchanged_max_interval_seconds"]),
             )
-            interval = min(interval, RSS_MAX_INTERVAL_SECONDS)
+            interval = min(interval, policy["max_interval_seconds"])
             unchanged_count = int(row["unchanged_count"] or 0) + 1
         next_fetch = now + max(
-            RSS_MIN_INTERVAL_SECONDS,
+            policy["min_interval_seconds"],
             int(interval * random.uniform(0.9, 1.1)),
         )
         con.execute(
@@ -4425,7 +4628,7 @@ def _record_shared_fetch_result(
                 updated_ts=?
             WHERE host=?""",
             (
-                now + random.randint(*RSS_HOST_GAP_SECONDS),
+                now + random.randint(*policy["host_gap_seconds"]),
                 result.http_status,
                 now,
                 host,
@@ -4539,19 +4742,19 @@ def _record_shared_fetch_result(
                 if other_denied:
                     # 非 Wiley host 延续较短退避；Wiley 使用上面的出版社级策略。
                     host_delay = min(
-                        2 * 60 * 60 * (2 ** max(0, host_failures - 2)),
-                        24 * 60 * 60,
+                        policy["access_denied_cooldown_seconds"] * 2 * (2 ** max(0, host_failures - 2)),
+                        policy["access_denied_max_cooldown_seconds"],
                     )
                 else:
-                    host_delay = 60 * 60
+                    host_delay = policy["access_denied_cooldown_seconds"]
                 host_blocked_until = max(host_blocked_until, now + host_delay)
         elif result.category == "rate_limited":
             host_failures += 1
             host_delay = max(
                 int(result.retry_after_seconds or 0),
                 min(
-                    6 * 60 * 60 * (2 ** max(0, host_failures - 1)),
-                    7 * 24 * 60 * 60,
+                    policy["rate_limited_base_cooldown_seconds"] * (2 ** max(0, host_failures - 1)),
+                    policy["rate_limited_max_cooldown_seconds"],
                 ),
             )
             host_blocked_until = max(host_blocked_until, now + host_delay)
@@ -4562,7 +4765,7 @@ def _record_shared_fetch_result(
                 last_error_ts=?, updated_ts=?
             WHERE host=?""",
             (
-                now + random.randint(*RSS_HOST_GAP_SECONDS),
+                now + random.randint(*policy["host_gap_seconds"]),
                 host_blocked_until,
                 host_failures,
                 result.http_status,
@@ -4584,6 +4787,7 @@ def _record_shared_fetch_result(
 
 def _next_shared_fetch_ts(feeds, now=None):
     now = int(time.time() if now is None else now)
+    policy = _rss_fetch_config()
     con = _shared_content_db()
     publisher_row = con.execute(
         """SELECT blocked_until_ts FROM publisher_fetch_state
@@ -4611,10 +4815,11 @@ def _next_shared_fetch_ts(feeds, now=None):
                 wiley_blocked_until if _is_wiley_rss_host(host) else 0,
             ))
     con.close()
-    return max(now + 60, min(values)) if values else now + RSS_DEFAULT_INTERVAL_SECONDS
+    return max(now + 60, min(values)) if values else now + policy["default_interval_seconds"]
 
 
 def _fetch_host_group(host, states, per_feed_limit, since_ts, *, probe=False):
+    policy = _rss_fetch_config()
     results = []
     session = _make_pinned_feed_session(host)
     try:
@@ -4635,7 +4840,7 @@ def _fetch_host_group(host, states, per_feed_limit, since_ts, *, probe=False):
             if result.category in {"access_denied", "rate_limited"}:
                 break
             if index < len(states) - 1:
-                time.sleep(random.uniform(*RSS_HOST_GAP_SECONDS))
+                time.sleep(random.uniform(*policy["host_gap_seconds"]))
     finally:
         session.close()
     return results
@@ -4699,10 +4904,12 @@ def _shared_collect_new(
     per_feed_limit=3,
     progress_callback=None,
     since_ts=0,
-    fallback_interval=RSS_DEFAULT_INTERVAL_SECONDS,
+    fallback_interval=None,
 ):
     """按并集抓取 RSS，对 shared_seen 去重，返回新 item 列表（附 feed_url/feed_title）。"""
 
+    policy = _rss_fetch_config()
+    fallback_interval = int(fallback_interval or policy["default_interval_seconds"])
     claimed = _claim_due_shared_feeds(feeds)
     con = _shared_content_db()
     new_items = []
@@ -4715,7 +4922,7 @@ def _shared_collect_new(
         con.close()
         return []
 
-    with ThreadPoolExecutor(max_workers=min(RSS_HOST_WORKERS, len(groups))) as executor:
+    with ThreadPoolExecutor(max_workers=min(policy["rss_host_workers"], len(groups))) as executor:
         futures = {
             executor.submit(
                 _fetch_host_group,
@@ -4772,6 +4979,7 @@ def probe_shared_rss_feed(url, *, override_cooldown=False, now=None):
     """Operator-only caller helper: probe one subscribed feed with one request."""
 
     now = int(time.time() if now is None else now)
+    policy = _rss_fetch_config()
     normalized = _normalize_feed_url(url)
     feeds = _active_tenant_feed_union()
     if normalized not in feeds:
@@ -4799,7 +5007,7 @@ def probe_shared_rss_feed(url, *, override_cooldown=False, now=None):
         return {"ok": False, "error": "state_missing", "status_code": 500}
     last_probe = int(row["last_probe_ts"] or 0)
     probe_allowed_at = (
-        last_probe + RSS_PROBE_COOLDOWN_SECONDS if last_probe else 0
+        last_probe + policy["probe_cooldown_seconds"] if last_probe else 0
     )
     if probe_allowed_at > now:
         return {
@@ -5730,6 +5938,7 @@ def get_admin_settings():
     rss.setdefault("lookback_days", 7)
     rss.setdefault("interest_score_threshold", 70)
     rss["preference_weights"] = _preference_weights(cfg)
+    rss.update(validate_rss_fetch_settings(raw_cfg.get("rss") or {}))
     rss.update(get_rss_fetch_window(cfg))
     schedule = cfg.setdefault("schedule", {})
     schedule.setdefault("rss_discovery_interval_minutes", 60)
@@ -5788,6 +5997,14 @@ def save_admin_settings(data):
             patch["preference_weights"] = validate_preference_weights(
                 patch["preference_weights"]
             )
+        if section == "rss" and set(RSS_FETCH_CONFIG_DEFAULTS).intersection(patch):
+            normalized_fetch = validate_rss_fetch_settings({
+                **(cfg.get("rss") or {}),
+                **patch,
+            })
+            for key in RSS_FETCH_CONFIG_DEFAULTS:
+                if key in patch:
+                    patch[key] = normalized_fetch[key]
         cfg.setdefault(section, {}).update(patch)
     new_lookback_days = _rss_lookback_days(cfg)
     if new_lookback_days != old_lookback_days:

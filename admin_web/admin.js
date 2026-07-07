@@ -43,6 +43,55 @@ function h(value) {
   }[c]));
 }
 
+function cfgValue(obj, key, fallback) {
+  return obj && obj[key] !== undefined && obj[key] !== null ? obj[key] : fallback;
+}
+
+const RSS_FETCH_FIELDS = [
+  ["rss_min_interval_minutes", "最小抓取间隔(分)", 15, 1],
+  ["rss_default_interval_minutes", "默认抓取间隔(分)", 60, 1],
+  ["rss_unchanged_max_interval_minutes", "无更新最大间隔(分)", 360, 1],
+  ["rss_max_interval_minutes", "最大抓取间隔(分)", 1440, 1],
+  ["rss_feed_lease_minutes", "抓取租约时间(分)", 60, 1],
+  ["rss_probe_cooldown_minutes", "单源探测冷却(分)", 60, 0],
+  ["rss_host_workers", "Host 并发组数", 4, 1],
+  ["rss_host_gap_min_seconds", "同Host休息最短(秒)", 5, 0],
+  ["rss_host_gap_max_seconds", "同Host休息最长(秒)", 15, 0],
+  ["rss_access_denied_cooldown_minutes", "403冷却基准(分)", 60, 1],
+  ["rss_access_denied_max_cooldown_minutes", "403冷却上限(分)", 1440, 1],
+  ["rss_rate_limited_base_cooldown_minutes", "429冷却基准(分)", 360, 1],
+  ["rss_rate_limited_max_cooldown_minutes", "429冷却上限(分)", 10080, 1],
+  ["rss_not_found_base_cooldown_minutes", "404冷却基准(分)", 1440, 1],
+  ["rss_not_found_max_cooldown_minutes", "404冷却上限(分)", 10080, 1],
+  ["rss_not_found_disable_failures", "404禁用失败次数", 3, 1],
+  ["rss_client_error_base_cooldown_minutes", "4xx冷却基准(分)", 1440, 1],
+  ["rss_client_error_max_cooldown_minutes", "4xx冷却上限(分)", 10080, 1],
+  ["rss_client_error_disable_failures", "4xx禁用失败次数", 3, 1],
+  ["rss_gone_cooldown_minutes", "410禁用冷却(分)", 10080, 1],
+  ["rss_unsafe_tls_cooldown_minutes", "TLS/不安全URL冷却(分)", 10080, 1],
+  ["rss_invalid_feed_base_cooldown_minutes", "无效Feed冷却基准(分)", 360, 1],
+  ["rss_invalid_feed_max_cooldown_minutes", "无效Feed冷却上限(分)", 1440, 1],
+  ["rss_transient_base_cooldown_minutes", "临时错误冷却基准(分)", 15, 1],
+  ["rss_transient_max_cooldown_minutes", "临时错误冷却上限(分)", 360, 1],
+  ["rss_wiley_403_min_cooldown_minutes", "Wiley 403冷却基准(分)", 1440, 1],
+  ["rss_wiley_403_max_cooldown_minutes", "Wiley 403冷却上限(分)", 10080, 1],
+].map(([key, label, defaultValue, min]) => ({key, label, defaultValue, min}));
+
+function renderRssFetchFields(rss) {
+  return RSS_FETCH_FIELDS.map(field => `
+    <label>${h(field.label)}
+      <input id="${h(field.key)}" type="number" min="${h(field.min)}" step="1" value="${h(cfgValue(rss, field.key, field.defaultValue))}">
+    </label>`).join("");
+}
+
+function readRssFetchSettings() {
+  const result = {};
+  RSS_FETCH_FIELDS.forEach(field => {
+    result[field.key] = Number(document.getElementById(field.key).value || field.defaultValue);
+  });
+  return result;
+}
+
 function api(path, options = {}) {
   const headers = Object.assign({}, options.headers || {});
   if (!(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
@@ -354,7 +403,14 @@ async function renderFeeds() {
       "rss-source-list",
       "RSS 源名称",
       `<div class="tableWrap"><table><thead><tr><th>名称</th><th>URL</th><th></th></tr></thead><tbody>
-        ${feeds.map(f => `<tr><td>${h(f.title)}</td><td>${h(f.url)}</td><td><button class="danger" data-delete-feed="${encodeURIComponent(f.url)}">删除</button></td></tr>`).join("") || `<tr><td colspan="3">暂无 RSS 源</td></tr>`}
+        ${feeds.map((f, i) => `<tr>
+          <td><input id="feedTitleEdit${i}" value="${h(f.title)}"></td>
+          <td><input id="feedUrlEdit${i}" value="${h(f.url)}"></td>
+          <td class="nowrap">
+            <button data-update-feed="${h(encodeURIComponent(f.url))}" data-feed-index="${i}">保存</button>
+            <button class="danger" data-delete-feed="${h(encodeURIComponent(f.url))}">删除</button>
+          </td>
+        </tr>`).join("") || `<tr><td colspan="3">暂无 RSS 源</td></tr>`}
       </tbody></table></div>`,
       {meta: `${feeds.length} 个`}
     )}`;
@@ -501,6 +557,12 @@ async function renderSettings() {
       <div class="toolbar inlineToolbar">
         <button id="resetRssTimeBtn">按当前天数重置抓取起点</button>
         <span class="label">默认仅抓取最近 7 天；无发布日期的条目仍按源内最新条目处理。</span>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>RSS 抓取策略</h2>
+      <div class="grid">
+        ${renderRssFetchFields(rss)}
       </div>
     </div>
     <div class="panel">
@@ -897,6 +959,18 @@ document.addEventListener("click", async e => {
     await api("/api/feeds/import", {method: "POST", body: form});
     renderFeeds();
   }
+  if (e.target.dataset.updateFeed) {
+    const index = e.target.dataset.feedIndex;
+    await api("/api/feeds", {
+      method: "PATCH",
+      body: JSON.stringify({
+        old_url: decodeURIComponent(e.target.dataset.updateFeed),
+        title: document.getElementById(`feedTitleEdit${index}`).value,
+        url: document.getElementById(`feedUrlEdit${index}`).value,
+      }),
+    });
+    renderFeeds();
+  }
   if (e.target.dataset.deleteFeed) {
     await api(`/api/feeds/${e.target.dataset.deleteFeed}`, {method: "DELETE"});
     renderFeeds();
@@ -948,6 +1022,7 @@ document.addEventListener("click", async e => {
         max_push_items: Number(document.getElementById("maxPushItems").value || 20),
         lookback_days: Number(document.getElementById("rssLookbackDays").value || 7),
         preference_weights: preferenceWeights,
+        ...readRssFetchSettings(),
       },
       ai: {
         api_key: document.getElementById("aiKey").value,

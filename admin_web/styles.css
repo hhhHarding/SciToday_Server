@@ -149,6 +149,7 @@ textarea { resize: vertical; }
   font-weight: 700;
 }
 .label { color: var(--muted); font-size: 12px; }
+.nowrap { white-space: nowrap; }
 .row { display: flex; gap: 8px; align-items: center; }
 .row > * { flex: 1; }
 .copyField { display: block; min-width: 0; }

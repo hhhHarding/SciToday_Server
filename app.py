@@ -112,7 +112,7 @@ OPERATOR_ENDPOINTS = frozenset(
 )
 # 破坏性/写配置类租户接口：需要 tenant_admin scope。
 # 纯 app scope 的手机 token 只能读、推送、上传、标记偏好，不能抹数据或改配置。
-# 注意：RSS 源的增删/导入（add_feed/delete_feed/import_opml）属于租户管理自己内容的
+# 注意：RSS 源的增删改/导入（add_feed/update_feed/delete_feed/import_opml）属于租户管理自己内容的
 # 常规操作，不是破坏性管理，故只需 app scope（与 get_feeds 一致），不在此集合中。
 # 同理：删单张卡片（api_delete_digest）是软删（只从本租户显示列表隐藏、可恢复、不动共享
 # 内容），属常规内容管理，只需 app scope；仅批量清空 api_clear_digests 才留在此集合。
@@ -1030,6 +1030,31 @@ def add_feed():
     tasks.add_feed_to_opml(opml, title, url)
     _trigger_feed_union_refresh()
     return jsonify({"ok": True})
+
+
+@app.route("/api/feeds", methods=["PATCH"])
+def update_feed():
+    data = request.get_json(silent=True) or request.form
+    old_url = str(data.get("old_url") or "").strip()
+    title = str(data.get("title") or "").strip()
+    url = str(data.get("url") or "").strip()
+    if not old_url:
+        return jsonify({"error": "缺少 old_url"}), 400
+    if not url:
+        return jsonify({"error": "缺少 url"}), 400
+    if not title:
+        title = urlsplit(url).hostname or url
+
+    cfg = tasks.load_config()
+    opml = tasks.get_opml_path(cfg)
+    try:
+        updated = tasks.update_feed_in_opml(opml, old_url, title, url)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    if not updated:
+        return jsonify({"error": "RSS 源不存在"}), 404
+    _trigger_feed_union_refresh()
+    return jsonify({"ok": True, "count": len(tasks.parse_opml(opml))})
 
 
 @app.route("/api/feeds/<path:url>", methods=["DELETE"])
