@@ -363,6 +363,7 @@ def public_config(config=None):
     rss = cfg.get("rss")
     if isinstance(rss, dict):
         rss["opml_path"] = "feedly.opml"
+        rss["preference_weights"] = _preference_weights(cfg)
     pc = cfg.get("pc")
     if isinstance(pc, dict):
         for key in (

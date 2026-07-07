@@ -645,6 +645,18 @@ def _coerce_config_int(key, value):
     return number
 
 
+def _apply_recommendation_settings(incoming):
+    cfg = tasks.load_config()
+    old_preference_weights = tasks._preference_weights(cfg)
+    cfg.setdefault("rss", {}).update(incoming)
+    tasks.save_config(cfg)
+    new_preference_weights = tasks._preference_weights(cfg)
+    if new_preference_weights != old_preference_weights:
+        tasks.recalculate_preference_weights(new_preference_weights, mark_dirty=True)
+        if tasks._interest_profile_state()["version"] > 0:
+            tasks.schedule_interest_profile_refresh(force=True)
+
+
 @app.route("/api/config", methods=["GET"])
 def api_config():
     cfg = tasks.load_config()
@@ -679,17 +691,10 @@ def api_save_config():
             and isinstance(data.get("rss"), dict)
             and "app" in principal.scopes
         ):
-            if set(data["rss"]) != {"interest_score_threshold"}:
-                return jsonify({
-                    "error": "forbidden",
-                    "required_scope": "tenant_admin",
-                }), 403
-            threshold, error = _validate_recommendation_settings(data["rss"])
+            incoming, error = _validate_recommendation_settings(data["rss"])
             if error:
                 return jsonify({"error": error}), 400
-            cfg = tasks.load_config()
-            cfg.setdefault("rss", {})["interest_score_threshold"] = threshold
-            tasks.save_config(cfg)
+            _apply_recommendation_settings(incoming)
             return jsonify({"ok": True, "compatibility_mode": True})
 
         if (
@@ -829,15 +834,29 @@ def _validate_schedule_settings(data):
 
 
 def _validate_recommendation_settings(data):
-    if not isinstance(data, dict) or set(data) != {"interest_score_threshold"}:
-        return None, "仅允许修改 interest_score_threshold"
-    try:
-        threshold = float(data["interest_score_threshold"])
-    except (TypeError, ValueError):
-        return None, "interest_score_threshold 必须是0到100的数字"
-    if threshold < 0 or threshold > 100:
-        return None, "interest_score_threshold 必须在0到100之间"
-    return round(threshold, 2), None
+    if not isinstance(data, dict) or not data:
+        return None, "请求体必须是非空 JSON 对象"
+    allowed = {"interest_score_threshold", "preference_weights"}
+    unknown = sorted(set(data) - allowed)
+    if unknown:
+        return None, f"不允许修改字段: {', '.join(unknown)}"
+    incoming = {}
+    if "interest_score_threshold" in data:
+        try:
+            threshold = float(data["interest_score_threshold"])
+        except (TypeError, ValueError):
+            return None, "interest_score_threshold 必须是0到100的数字"
+        if threshold < 0 or threshold > 100:
+            return None, "interest_score_threshold 必须在0到100之间"
+        incoming["interest_score_threshold"] = round(threshold, 2)
+    if "preference_weights" in data:
+        try:
+            incoming["preference_weights"] = tasks.validate_preference_weights(
+                data["preference_weights"]
+            )
+        except ValueError as exc:
+            return None, str(exc)
+    return incoming, None
 
 
 @app.route("/api/settings/schedule", methods=["PATCH"])
@@ -861,16 +880,14 @@ def api_save_schedule_settings():
 
 @app.route("/api/settings/recommendation", methods=["PATCH"])
 def api_save_recommendation_settings():
-    """Allow an app token to update the tenant's recommendation threshold."""
-    threshold, error = _validate_recommendation_settings(
+    """Allow an app token to update tenant-local recommendation preferences."""
+    incoming, error = _validate_recommendation_settings(
         request.get_json(silent=True)
     )
     if error:
         return jsonify({"error": error}), 400
 
-    cfg = tasks.load_config()
-    cfg.setdefault("rss", {})["interest_score_threshold"] = threshold
-    tasks.save_config(cfg)
+    _apply_recommendation_settings(incoming)
     return jsonify({"ok": True})
 
 
