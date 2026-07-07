@@ -35,6 +35,7 @@ try:
 except ImportError:  # psutil 是可选依赖；缺失时性能监控降级为不可用。
     psutil = None
 
+import embed_store
 import push
 from auth import (
     UnsafeOutboundURLError,
@@ -2105,6 +2106,7 @@ def _digest_from_file(path):
     recommendation_type = ""
     interest_profile_version = 0
     scored_at = 0
+    disliked = False
     try:
         content = path.read_text(encoding="utf-8", errors="replace")
         src_match = re.search(r'<meta name="digest-source" content="([^"]*)">', content)
@@ -2139,6 +2141,7 @@ def _digest_from_file(path):
         for key in (
             "relevance-score", "novelty-score", "final-score",
             "recommendation-type", "interest-profile-version", "scored-at",
+            "digest-disliked",
         ):
             match = re.search(
                 rf'<meta name="{key}" content="([^"]*)">',
@@ -2152,6 +2155,7 @@ def _digest_from_file(path):
         recommendation_type = recommendation_meta["recommendation-type"]
         interest_profile_version = int(recommendation_meta["interest-profile-version"] or 0)
         scored_at = int(recommendation_meta["scored-at"] or 0)
+        disliked = recommendation_meta["digest-disliked"].lower() in {"1", "true", "yes"}
     except Exception:
         pass
 
@@ -2168,6 +2172,7 @@ def _digest_from_file(path):
         "journal": journal,
         "source": src,
         "preview": preview,
+        "disliked": disliked,
         "relevance_score": relevance_score,
         "novelty_score": novelty_score,
         "final_score": final_score,
@@ -2178,14 +2183,15 @@ def _digest_from_file(path):
     }
 
 
-def _upsert_digest(con, digest):
+def _upsert_digest(con, digest, overwrite_flags=False):
     journal = digest.get("journal", "")
     group_key = _journal_group_key(journal)
     con.execute("""INSERT INTO digests
         (filename, timestamp, title, cn_title, keywords, journal, source, preview,
+         disliked,
          relevance_score, novelty_score, final_score, recommendation_type,
          interest_profile_version, scored_at, created_ts, journal_group_key)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(filename) DO UPDATE SET
             timestamp=excluded.timestamp,
             title=excluded.title,
@@ -2194,6 +2200,7 @@ def _upsert_digest(con, digest):
             journal=excluded.journal,
             source=excluded.source,
             preview=excluded.preview,
+            disliked=CASE WHEN ? THEN excluded.disliked ELSE digests.disliked END,
             relevance_score=excluded.relevance_score,
             novelty_score=excluded.novelty_score,
             final_score=excluded.final_score,
@@ -2203,14 +2210,15 @@ def _upsert_digest(con, digest):
             created_ts=excluded.created_ts,
             journal_group_key=excluded.journal_group_key""",
                 (digest["filename"], digest["timestamp"], digest["title"],
-                 digest.get("cn_title", ""), digest.get("keywords", ""),
-                 journal, digest.get("source", "rss"),
-                 digest.get("preview", ""), digest.get("relevance_score"),
-                 digest.get("novelty_score"), digest.get("final_score"),
-                 digest.get("recommendation_type", ""),
-                 int(digest.get("interest_profile_version") or 0),
-                 int(digest.get("scored_at") or 0), digest["created_ts"],
-                 group_key))
+                  digest.get("cn_title", ""), digest.get("keywords", ""),
+                  journal, digest.get("source", "rss"),
+                  digest.get("preview", ""), 1 if digest.get("disliked") else 0,
+                  digest.get("relevance_score"),
+                  digest.get("novelty_score"), digest.get("final_score"),
+                  digest.get("recommendation_type", ""),
+                  int(digest.get("interest_profile_version") or 0),
+                  int(digest.get("scored_at") or 0), digest["created_ts"],
+                  group_key, 1 if overwrite_flags else 0))
 
 
 # inbox 索引哨兵：读/轮询接口此前每次都全量重扫 inbox（每文件读盘+~15条正则+upsert），
@@ -2245,12 +2253,59 @@ def _inbox_sentinel():
     return (count, max_mtime)
 
 
+def _digest_embedding_rows(con):
+    rows = con.execute(
+        """SELECT filename, title, cn_title, keywords, journal, preview
+           FROM digests
+           WHERE source='rss'
+           ORDER BY filename"""
+    ).fetchall()
+    return [{
+        "filename": row[0],
+        "title": row[1] or "",
+        "cn_title": row[2] or "",
+        "keywords": row[3] or "",
+        "journal": row[4] or "",
+        "preview": row[5] or "",
+    } for row in rows]
+
+
+def _sync_digest_embeddings_if_needed(con=None, inbox_sentinel=None):
+    tenant_id = get_current_tenant_id()
+    tenant_dir = current_tenant_paths().tenant_dir
+    try:
+        if not embed_store.needs_sync(
+            tenant_id,
+            tenant_dir,
+            inbox_sentinel=inbox_sentinel,
+            logger=logger,
+        ):
+            return
+        close_after = con is None
+        if close_after:
+            con = _digest_db()
+        try:
+            embed_store.sync_from_digest_rows(
+                tenant_id,
+                tenant_dir,
+                _digest_embedding_rows(con),
+                inbox_sentinel=inbox_sentinel,
+                logger=logger,
+            )
+        finally:
+            if close_after and con is not None:
+                con.close()
+    except Exception as exc:
+        logger.warning("语义检索向量同步失败，继续使用 FTS5: %s", exc)
+
+
 def _sync_digest_index(force=False):
     tenant_id, lock = _digest_index_state()
     inbox_dir = Path(os.fspath(INBOX_DIR))
     sentinel = _inbox_sentinel()
     with lock:
         if not force and sentinel == _digest_index_sentinels.get(tenant_id):
+            _sync_digest_embeddings_if_needed(inbox_sentinel=sentinel)
             return
         con = _digest_db()
         actual = set()
@@ -2266,9 +2321,11 @@ def _sync_digest_index(force=False):
             if filename not in actual:
                 con.execute("DELETE FROM digests WHERE filename=?", (filename,))
         con.commit()
+        refreshed_sentinel = _inbox_sentinel()
+        _sync_digest_embeddings_if_needed(con, inbox_sentinel=refreshed_sentinel)
         con.close()
         # 用对账「之后」重新采样的哨兵，避免把对账期间新落地的文件漏在下次判断之外。
-        _digest_index_sentinels[tenant_id] = _inbox_sentinel()
+        _digest_index_sentinels[tenant_id] = refreshed_sentinel
 
 
 def record_digest(
@@ -2290,6 +2347,7 @@ def record_digest(
         })
         if recommendation:
             digest.update({
+                "disliked": bool(recommendation.get("disliked")),
                 "relevance_score": recommendation.get("relevance_score"),
                 "novelty_score": recommendation.get("novelty_score"),
                 "final_score": recommendation.get("final_score"),
@@ -2298,7 +2356,7 @@ def record_digest(
                 "scored_at": int(recommendation.get("scored_at") or 0),
             })
         con = _digest_db()
-        _upsert_digest(con, digest)
+        _upsert_digest(con, digest, overwrite_flags=bool((recommendation or {}).get("disliked")))
         con.commit()
         con.close()
     except Exception as e:
@@ -2922,6 +2980,9 @@ def _interest_score_threshold(config=None):
     return max(0.0, min(100.0, value))
 
 
+AI_DISLIKE_SCORE_THRESHOLD = 20.0
+
+
 def _candidate_for_scoring(item):
     return {
         "candidate_id": _rss_item_key(item),
@@ -3065,6 +3126,20 @@ def score_items_for_tenant(items, config=None):
         if _rss_item_key(item) in explore_keys:
             item["recommendation_type"] = "explore"
 
+    disliked_count = 0
+    for item in result:
+        if item.get("recommendation_type"):
+            continue
+        final_score = item.get("final_score")
+        if final_score is None:
+            continue
+        try:
+            if float(final_score) < AI_DISLIKE_SCORE_THRESHOLD:
+                item["disliked"] = True
+                disliked_count += 1
+        except (TypeError, ValueError):
+            continue
+
     ai_count = sum(1 for item in result if item.get("recommendation_type") == "ai")
     explore_count = sum(1 for item in result if item.get("recommendation_type") == "explore")
     record_event("rss_scoring", "RSS 个性化评分完成", details={
@@ -3072,7 +3147,9 @@ def score_items_for_tenant(items, config=None):
         "scored_count": len(score_map),
         "ai_recommended": ai_count,
         "ai_explore": explore_count,
+        "ai_disliked": disliked_count,
         "threshold": threshold,
+        "dislike_threshold": AI_DISLIKE_SCORE_THRESHOLD,
         "profile_version": profile["version"],
     })
     return result
@@ -3252,6 +3329,7 @@ def save_html(title, content, source="rss", pdf_path=None, journal="", recommend
         ("recommendation-type", recommendation.get("recommendation_type", "")),
         ("interest-profile-version", recommendation.get("interest_profile_version", 0)),
         ("scored-at", recommendation.get("scored_at", 0)),
+        ("digest-disliked", 1 if recommendation.get("disliked") else None),
     ):
         if value is not None and str(value) != "":
             extra_meta.append(
@@ -3861,6 +3939,7 @@ def _publish_rss_item(item, idx=1, total=1, progress_callback=None, config=None)
         "recommendation_type": item.get("recommendation_type", ""),
         "interest_profile_version": item.get("interest_profile_version", 0),
         "scored_at": item.get("scored_at", 0),
+        "disliked": bool(item.get("disliked")),
     }
     filename, ts = save_html(
         item["title"], digest, journal=journal, recommendation=recommendation
@@ -3872,7 +3951,8 @@ def _publish_rss_item(item, idx=1, total=1, progress_callback=None, config=None)
         filename, ts, item["title"], digest, source="rss", cn_title=cn_title,
         keywords=keywords, journal=journal, recommendation=recommendation,
     )
-    push.send_digest_notification(cn_title, keywords, filename, config=config)
+    if not recommendation.get("disliked"):
+        push.send_digest_notification(cn_title, keywords, filename, config=config)
     return filename
 
 
@@ -4987,6 +5067,7 @@ def deliver_shared_to_tenant(progress_callback=None):
                 "recommendation_type": item.get("recommendation_type", ""),
                 "interest_profile_version": item.get("interest_profile_version", 0),
                 "scored_at": item.get("scored_at", 0),
+                "disliked": bool(item.get("disliked")),
             }
             filename, ts = save_html(
                 item["title"], digest, source="rss", journal=journal,
@@ -5006,7 +5087,8 @@ def deliver_shared_to_tenant(progress_callback=None):
             # register the same article in this tenant's pending candidate DB.
             register_pending(item)
             _mark_delivered(tenant_id, item["item_key"], filename)
-            push.send_digest_notification(cn_title, keywords, filename, config=cfg)
+            if not recommendation.get("disliked"):
+                push.send_digest_notification(cn_title, keywords, filename, config=cfg)
             delivered += 1
             time.sleep(0.5)
         except Exception as e:
@@ -5807,6 +5889,7 @@ def reset_seen_to_recent_week():
 AI_SEARCH_CANDIDATE_LIMIT = 100
 AI_SEARCH_RESULT_LIMIT = 30
 AI_SEARCH_PREVIEW_CHARS = 300
+AI_SEARCH_RRF_K = 60
 _DIGEST_SELECT_COLUMNS = """filename, timestamp, title, cn_title, keywords,
     journal, source, preview, disliked, interested, is_read, relevance_score,
     novelty_score, final_score, recommendation_type, interest_profile_version,
@@ -5879,7 +5962,7 @@ def _compat_digest_candidates(con, query, limit):
     rows = con.execute(
         f"""SELECT {_DIGEST_SELECT_COLUMNS}, created_ts
             FROM digests
-            WHERE deleted=0 AND source='rss'"""
+            WHERE deleted=0 AND source='rss' AND disliked=0"""
     ).fetchall()
     normalized = _normalize_ai_search_query(query)
     terms = _ai_search_terms(query)
@@ -5902,38 +5985,133 @@ def _compat_digest_candidates(con, query, limit):
     return [_digest_row_to_dict(item[2]) for item in ranked[:limit]]
 
 
+def _expand_ai_search_query(query):
+    try:
+        return embed_store.expand_query(query, current_tenant_paths().tenant_dir)
+    except Exception as exc:
+        logger.warning("检索词表扩展失败，继续使用原始 query: %s", exc)
+        return str(query or "")
+
+
+def _lexical_digest_candidates(con, query, limit):
+    terms = _ai_search_terms(query)
+    has_fts = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='digests_fts'"
+    ).fetchone()
+    if has_fts and terms:
+        match_query = " OR ".join(
+            f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms
+        )
+        rows = con.execute(
+            f"""SELECT {_DIGEST_SELECT_COLUMNS_QUALIFIED}
+                FROM digests_fts
+                JOIN digests ON digests.id=digests_fts.rowid
+                WHERE digests_fts MATCH ?
+                  AND digests.deleted=0
+                  AND digests.source='rss'
+                  AND digests.disliked=0
+                ORDER BY bm25(digests_fts, 8.0, 8.0, 6.0, 2.0, 1.0),
+                         digests.created_ts DESC, digests.id DESC
+                LIMIT ?""",
+            (match_query, limit),
+        ).fetchall()
+        if rows:
+            return [_digest_row_to_dict(row) for row in rows]
+    return _compat_digest_candidates(con, query, limit)
+
+
+def _semantic_digest_candidate_filenames(query, limit):
+    try:
+        return embed_store.search(
+            query,
+            get_current_tenant_id(),
+            current_tenant_paths().tenant_dir,
+            limit=limit,
+            logger=logger,
+        )
+    except Exception as exc:
+        logger.warning("语义检索召回失败，继续使用 FTS5: %s", exc)
+        return []
+
+
+def _rrf_merge_filenames(rankings, limit, k=AI_SEARCH_RRF_K):
+    scores = {}
+    first_seen = {}
+    for source_index, ranking in enumerate(rankings):
+        seen_in_ranking = set()
+        for rank, filename in enumerate(ranking or []):
+            if not filename or filename in seen_in_ranking:
+                continue
+            seen_in_ranking.add(filename)
+            scores[filename] = scores.get(filename, 0.0) + 1.0 / (k + rank + 1)
+            current = first_seen.get(filename)
+            marker = (rank, source_index)
+            if current is None or marker < current:
+                first_seen[filename] = marker
+    return sorted(
+        scores,
+        key=lambda filename: (-scores[filename], first_seen.get(filename, (999999, 999999)), filename),
+    )[:limit]
+
+
+def _ordered_digest_candidates(con, filenames, limit):
+    ordered = []
+    seen = set()
+    for filename in filenames or []:
+        name = str(filename or "").strip()
+        if not name or "/" in name or "\\" in name or ".." in name or name in seen:
+            continue
+        seen.add(name)
+        ordered.append(name)
+        if len(ordered) >= limit:
+            break
+    if not ordered:
+        return []
+    placeholders = ",".join("?" for _ in ordered)
+    rows = con.execute(
+        f"""SELECT {_DIGEST_SELECT_COLUMNS}
+            FROM digests
+            WHERE deleted=0
+              AND source='rss'
+              AND disliked=0
+              AND filename IN ({placeholders})""",
+        ordered,
+    ).fetchall()
+    by_filename = {
+        item["filename"]: item
+        for item in (_digest_row_to_dict(row) for row in rows)
+    }
+    return [by_filename[name] for name in ordered if name in by_filename]
+
+
 def search_digest_candidates(query, limit=AI_SEARCH_CANDIDATE_LIMIT):
-    """Return a tenant-local lexical shortlist for AI reranking."""
+    """Return a tenant-local FTS/vector shortlist for AI reranking."""
     normalized = _normalize_ai_search_query(query)
     limit = max(1, min(int(limit or AI_SEARCH_CANDIDATE_LIMIT), AI_SEARCH_CANDIDATE_LIMIT))
     if not normalized:
         return []
+    expanded_query = _expand_ai_search_query(query)
     _sync_digest_index()
     con = _digest_db()
     try:
-        terms = _ai_search_terms(normalized)
-        has_fts = con.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='digests_fts'"
-        ).fetchone()
-        if has_fts and terms:
-            match_query = " OR ".join(
-                f'"{term.replace(chr(34), chr(34) * 2)}"' for term in terms
-            )
-            rows = con.execute(
-                f"""SELECT {_DIGEST_SELECT_COLUMNS_QUALIFIED}
-                    FROM digests_fts
-                    JOIN digests ON digests.id=digests_fts.rowid
-                    WHERE digests_fts MATCH ?
-                      AND digests.deleted=0
-                      AND digests.source='rss'
-                    ORDER BY bm25(digests_fts, 8.0, 8.0, 6.0, 2.0, 1.0),
-                             digests.created_ts DESC, digests.id DESC
-                    LIMIT ?""",
-                (match_query, limit),
-            ).fetchall()
-            if rows:
-                return [_digest_row_to_dict(row) for row in rows]
-        return _compat_digest_candidates(con, normalized, limit)
+        lexical = _lexical_digest_candidates(con, expanded_query, limit)
+        semantic = _semantic_digest_candidate_filenames(query, limit)
+        if not semantic:
+            return lexical
+        merged = _rrf_merge_filenames(
+            ([item["filename"] for item in lexical], semantic),
+            limit,
+        )
+        return _ordered_digest_candidates(con, merged, limit)
+    finally:
+        con.close()
+
+
+def _search_candidates_by_filenames(filenames, limit=AI_SEARCH_CANDIDATE_LIMIT):
+    _sync_digest_index()
+    con = _digest_db()
+    try:
+        return _ordered_digest_candidates(con, filenames, limit)
     finally:
         con.close()
 
@@ -5990,10 +6168,14 @@ def _ai_search_retryable(error):
     return False
 
 
-def ai_search_digests(query):
-    """Run lexical candidate retrieval followed by one AI reranking request."""
+def ai_search_digests(query, candidate_filenames=None, ai_rank=True):
+    """Run lexical candidate retrieval, optionally followed by AI reranking."""
     started = time.monotonic()
-    candidates = search_digest_candidates(query)
+    candidates = (
+        _search_candidates_by_filenames(candidate_filenames)
+        if candidate_filenames
+        else search_digest_candidates(query)
+    )
     if not candidates:
         logger.info("AI 检索完成 candidates=0 results=0 retries=0 elapsed_ms=%d",
                     int((time.monotonic() - started) * 1000))
@@ -6002,6 +6184,19 @@ def ai_search_digests(query):
             "candidate_count": 0,
             "ai_ranked": False,
             "items": [],
+        }
+    if not ai_rank:
+        logger.info(
+            "关键词检索完成 candidates=%d results=%d elapsed_ms=%d",
+            len(candidates),
+            len(candidates),
+            int((time.monotonic() - started) * 1000),
+        )
+        return {
+            "query": str(query).strip(),
+            "candidate_count": len(candidates),
+            "ai_ranked": False,
+            "items": candidates,
         }
 
     prompt = _ai_search_prompt(str(query).strip(), candidates)
@@ -6051,7 +6246,8 @@ def ai_search_digests(query):
 
 
 def get_recent_digests(limit=None, source=None, recommendation=None,
-                       journal_group_key=None, interested_only=False):
+                       journal_group_key=None, interested_only=False,
+                       disliked_only=False, exclude_disliked=False):
     if limit is not None:
         limit = int(limit)
         if limit <= 0:
@@ -6076,6 +6272,10 @@ def get_recent_digests(limit=None, source=None, recommendation=None,
             params.append(journal_group_key)
         if interested_only:
             clauses.append("interested=1")
+        if disliked_only:
+            clauses.append("disliked=1")
+        elif exclude_disliked:
+            clauses.append("disliked=0")
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         limit_clause = ""
         if limit is not None:
@@ -6101,8 +6301,12 @@ def get_recent_digests(limit=None, source=None, recommendation=None,
                 continue
             if recommendation in {"ai", "explore"} and digest.get("recommendation_type") != recommendation:
                 continue
+            if disliked_only and not digest.get("disliked"):
+                continue
+            if exclude_disliked and digest.get("disliked"):
+                continue
             digest.pop("created_ts", None)
-            digest["disliked"] = False
+            digest["disliked"] = bool(digest.get("disliked"))
             digest["interested"] = False
             digest["is_read"] = False
             digest["deleted"] = False
@@ -6112,7 +6316,7 @@ def get_recent_digests(limit=None, source=None, recommendation=None,
         return digests
 
 
-def get_digest_stats(source=None):
+def get_digest_stats(source=None, exclude_disliked=False):
     """某来源全库（未删除）卡片总数与已读数。只读，供状态条显示真实口径。"""
     _sync_digest_index()
     con = _digest_db()
@@ -6120,6 +6324,8 @@ def get_digest_stats(source=None):
     if source:
         clauses.append("source=?")
         params.append(source)
+    if exclude_disliked:
+        clauses.append("disliked=0")
     where = "WHERE " + " AND ".join(clauses)
     row = con.execute(
         f"SELECT COUNT(*), COALESCE(SUM(is_read),0) FROM digests {where}", params
@@ -6144,16 +6350,21 @@ def get_journal_stats(source=None):
     if source:
         base.append("source=?")
         params.append(source)
+    visible_where = "WHERE " + " AND ".join(base + ["disliked=0"])
     where = "WHERE " + " AND ".join(base)
     rows = con.execute(
         f"""SELECT journal_group_key, MAX(journal), COUNT(*),
             COALESCE(SUM(is_read),0)
-            FROM digests {where}
+            FROM digests {visible_where}
             GROUP BY journal_group_key""",
         params,
     ).fetchall()
     interested_row = con.execute(
         f"SELECT COUNT(*), COALESCE(SUM(is_read),0) FROM digests {where} AND interested=1",
+        params,
+    ).fetchone()
+    disliked_row = con.execute(
+        f"SELECT COUNT(*), COALESCE(SUM(is_read),0) FROM digests {where} AND disliked=1",
         params,
     ).fetchone()
     con.close()
@@ -6169,6 +6380,12 @@ def get_journal_stats(source=None):
             "title": "感兴趣",
             "total": int(interested_row[0] or 0),
             "read": int(interested_row[1] or 0),
+        },
+        "disliked": {
+            "key": "",
+            "title": "不喜欢",
+            "total": int(disliked_row[0] or 0),
+            "read": int(disliked_row[1] or 0),
         },
         "journals": journals,
     }

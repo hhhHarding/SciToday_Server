@@ -122,6 +122,80 @@ class DislikeMigrationTests(unittest.TestCase):
                 "disliked": 20,
             })
 
+    def test_ai_scoring_marks_low_final_score_as_disliked(self):
+        low = {"title": "Low relevance", "link": "https://example.test/low"}
+        ok = {"title": "Usable", "link": "https://example.test/ok"}
+        low_key = tasks._rss_item_key(low)
+        ok_key = tasks._rss_item_key(ok)
+
+        def fake_scores(candidates, profile):
+            return {
+                low_key: {"relevance_score": 5, "novelty_score": 5},
+                ok_key: {"relevance_score": 45, "novelty_score": 25},
+            }
+
+        with (
+            patch.object(tasks, "load_config", return_value={"rss": {"interest_score_threshold": 70}}),
+            patch.object(tasks, "_interest_profile_state", return_value={
+                "version": 1,
+                "new_count": 0,
+                "processed_new_count": 0,
+                "feedback_revision": 0,
+                "processed_feedback_revision": 0,
+            }),
+            patch.object(tasks, "get_interest_profile", return_value={
+                "profile": {"summary": "test"},
+                "version": 1,
+            }),
+            patch.object(tasks, "_score_candidate_chunk", side_effect=fake_scores),
+            patch.object(tasks, "record_event"),
+        ):
+            scored = tasks.score_items_for_tenant([low, ok])
+
+        self.assertTrue(scored[0]["disliked"])
+        self.assertNotEqual(scored[1].get("disliked"), True)
+
+    def test_digest_queries_split_disliked_from_visible_journal_groups(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "digests.db"
+            with (
+                patch.object(tasks, "DIGEST_DB", db_path),
+                patch.object(tasks, "_sync_digest_index"),
+            ):
+                tasks._reset_migration_cache_for_tests()
+                con = tasks._digest_db()
+                tasks._upsert_digest(con, {
+                    "filename": "visible.html",
+                    "timestamp": "20260707_100000",
+                    "title": "Visible",
+                    "journal": "A Journal",
+                    "source": "rss",
+                    "preview": "",
+                    "created_ts": 2,
+                    "disliked": False,
+                })
+                tasks._upsert_digest(con, {
+                    "filename": "hidden.html",
+                    "timestamp": "20260707_100001",
+                    "title": "Hidden",
+                    "journal": "A Journal",
+                    "source": "rss",
+                    "preview": "",
+                    "created_ts": 3,
+                    "disliked": True,
+                }, overwrite_flags=True)
+                con.commit()
+                con.close()
+
+                visible = tasks.get_recent_digests(source="rss", exclude_disliked=True)
+                disliked = tasks.get_recent_digests(source="rss", disliked_only=True)
+                stats = tasks.get_journal_stats(source="rss")
+
+        self.assertEqual([item["filename"] for item in visible], ["visible.html"])
+        self.assertEqual([item["filename"] for item in disliked], ["hidden.html"])
+        self.assertEqual(stats["journals"][0]["total"], 1)
+        self.assertEqual(stats["disliked"]["total"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

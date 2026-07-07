@@ -1,0 +1,10 @@
+# Optional semantic recall dependencies.
+# For CPU-only Ubuntu servers, install torch from the PyTorch CPU wheel index if
+# your default pip source selects CUDA wheels.
+# Example:
+#   python3 -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+#   python3 -m pip install -r requirements-embedding.txt
+--extra-index-url https://download.pytorch.org/whl/cpu
+numpy>=1.26,<3
+torch>=2.2,<3
+sentence-transformers>=2.7,<4

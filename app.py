@@ -1526,12 +1526,18 @@ def api_digests():
     # 分组模式展开某期刊时按分组键过滤；journal_group_key 显式传入（含空串="未标注期刊"）才生效。
     group_key = request.args.get("journal_group_key")
     interested_only = request.args.get("interested_only") in ("1", "true", "True")
+    disliked_only = request.args.get("disliked_only") in ("1", "true", "True")
+    exclude_disliked = request.args.get("exclude_disliked") in ("1", "true", "True")
+    if disliked_only and exclude_disliked:
+        return jsonify({"error": "disliked_only 和 exclude_disliked 不能同时启用"}), 400
     return jsonify(tasks.get_recent_digests(
         n,
         source=source,
         recommendation=recommendation,
         journal_group_key=group_key,
         interested_only=interested_only,
+        disliked_only=disliked_only,
+        exclude_disliked=exclude_disliked,
     ))
 
 
@@ -1549,8 +1555,23 @@ def api_ai_search_digests():
             "error": "query 长度必须为 1-200 个字符",
             "code": "invalid_query",
         }), 400
+    ai_rank = data.get("ai_rank", True)
+    if not isinstance(ai_rank, bool):
+        return jsonify({"error": "ai_rank 必须是布尔值", "code": "invalid_ai_rank"}), 400
+    candidate_filenames = data.get("candidate_filenames") or []
+    if not isinstance(candidate_filenames, list) or any(
+        not isinstance(item, str) for item in candidate_filenames
+    ):
+        return jsonify({
+            "error": "candidate_filenames 必须是字符串数组",
+            "code": "invalid_candidates",
+        }), 400
     try:
-        return jsonify(tasks.ai_search_digests(query))
+        return jsonify(tasks.ai_search_digests(
+            query,
+            candidate_filenames=candidate_filenames,
+            ai_rank=ai_rank,
+        ))
     except tasks.AiSearchUnavailableError as exc:
         return jsonify({"error": str(exc), "code": "ai_unavailable"}), 503
     except tasks.AiSearchFailedError as exc:
@@ -1560,7 +1581,8 @@ def api_ai_search_digests():
 @app.route("/api/digests/stats")
 def api_digest_stats():
     source = request.args.get("source") or None
-    return jsonify(tasks.get_digest_stats(source=source))
+    exclude_disliked = request.args.get("exclude_disliked") in ("1", "true", "True")
+    return jsonify(tasks.get_digest_stats(source=source, exclude_disliked=exclude_disliked))
 
 
 @app.route("/api/digests/journal-stats")
