@@ -92,6 +92,14 @@ function readRssFetchSettings() {
   return result;
 }
 
+function readAiSettings() {
+  return {
+    api_key: document.getElementById("aiKey").value,
+    base_url: document.getElementById("aiBaseUrl").value,
+    model: document.getElementById("aiModel").value,
+  };
+}
+
 function api(path, options = {}) {
   const headers = Object.assign({}, options.headers || {});
   if (!(options.body instanceof FormData)) headers["Content-Type"] = "application/json";
@@ -582,6 +590,10 @@ async function renderSettings() {
         <label>Model<input id="aiModel" value="${h(ai.model || "")}"></label>
         <label>API Key<input id="aiKey" type="password" value="${h(ai.api_key || "")}"></label>
       </div>
+      <div class="toolbar inlineToolbar">
+        <button id="testAiBtn">测试 AI API</button>
+        <span id="aiTestStatus" class="label">支持 OpenAI-compatible /chat/completions 和 Anthropic /v1/messages。</span>
+      </div>
       <label>System Prompt<textarea id="systemPrompt" rows="3">${h(ai.system_prompt || "")}</textarea></label>
       <label>RSS Prompt<textarea id="rssPrompt" rows="5">${h(ai.rss_prompt || "")}</textarea></label>
       <label>PDF Prompt<textarea id="pdfPrompt" rows="5">${h(ai.pdf_prompt || "")}</textarea></label>
@@ -983,6 +995,26 @@ document.addEventListener("click", async e => {
     });
     await renderSettings();
   }
+  if (e.target.id === "testAiBtn") {
+    const button = e.target;
+    const status = document.getElementById("aiTestStatus");
+    button.disabled = true;
+    if (status) status.textContent = "正在测试 AI API...";
+    try {
+      const result = await api("/api/ai-config/test", {
+        method: "POST",
+        body: JSON.stringify(readAiSettings()),
+      });
+      if (status) status.textContent = result.message || (result.ok ? "AI API 测试成功" : "AI API 测试失败");
+      alert(result.message || (result.ok ? "AI API 测试成功" : "AI API 测试失败"));
+    } catch (err) {
+      if (status) status.textContent = `AI API 测试失败：${err.message}`;
+      alert(`AI API 测试失败：${err.message}`);
+    } finally {
+      button.disabled = false;
+    }
+    return;
+  }
   if (e.target.id === "saveSettingsBtn") {
     const preferenceWeights = {
       pdf_matched: Number(document.getElementById("pdfMatchedWeight").value),
@@ -1025,9 +1057,7 @@ document.addEventListener("click", async e => {
         ...readRssFetchSettings(),
       },
       ai: {
-        api_key: document.getElementById("aiKey").value,
-        base_url: document.getElementById("aiBaseUrl").value,
-        model: document.getElementById("aiModel").value,
+        ...readAiSettings(),
         system_prompt: document.getElementById("systemPrompt").value,
         rss_prompt: document.getElementById("rssPrompt").value,
         pdf_prompt: document.getElementById("pdfPrompt").value,
@@ -1041,21 +1071,37 @@ document.addEventListener("click", async e => {
         cloudflare_tunnel_url: document.getElementById("serverPublicUrl").value,
       },
     };
-    await api("/api/admin/settings", {method: "POST", body: JSON.stringify(body)});
-    await api("/api/admin/local-settings", {method: "POST", body: JSON.stringify({
-      local: {
-        startup_enabled: document.getElementById("startupEnabled").checked,
-        host: document.getElementById("serverHost").value,
-        port: Number(document.getElementById("serverPort").value || 5200),
-        data_dir: document.getElementById("localDataDir").value,
-        server_data_dir: document.getElementById("serverDataDir").value,
-        download_dirs: splitDirs(document.getElementById("localDownloadDirs").value),
-        tunnel_mode: "Quick",
-        tunnel_enabled: document.getElementById("tunnelEnabled").checked,
-        tunnel_url: document.getElementById("serverPublicUrl").value,
+    e.target.disabled = true;
+    try {
+      const saved = await api("/api/admin/settings", {method: "POST", body: JSON.stringify(body)});
+      try {
+        await api("/api/admin/local-settings", {method: "POST", body: JSON.stringify({
+          local: {
+            startup_enabled: document.getElementById("startupEnabled").checked,
+            host: document.getElementById("serverHost").value,
+            port: Number(document.getElementById("serverPort").value || 5200),
+            data_dir: document.getElementById("localDataDir").value,
+            server_data_dir: document.getElementById("serverDataDir").value,
+            download_dirs: splitDirs(document.getElementById("localDownloadDirs").value),
+            tunnel_mode: "Quick",
+            tunnel_enabled: document.getElementById("tunnelEnabled").checked,
+            tunnel_url: document.getElementById("serverPublicUrl").value,
+          }
+        })});
+      } catch (localErr) {
+        const ai = ((saved.settings || {}).ai || {});
+        alert(`设置已保存，但本地后台设置保存失败：${localErr.message}\n\nAI Base URL: ${ai.base_url || ""}\nModel: ${ai.model || ""}`);
+        await renderSettings();
+        return;
       }
-    })});
-    refresh();
+      const ai = ((saved.settings || {}).ai || {});
+      alert(`保存成功。\n\nAI Base URL: ${ai.base_url || ""}\nModel: ${ai.model || ""}`);
+      await refresh();
+    } catch (err) {
+      alert(`保存失败：${err.message}`);
+    } finally {
+      e.target.disabled = false;
+    }
   }
   if (e.target.dataset.copy !== undefined) {
     const value = e.target.dataset.copy || "";

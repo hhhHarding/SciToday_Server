@@ -2606,6 +2606,7 @@ def _normalize_ai_base_url(value):
 
     例如 DeepSeek 的 ``https://api.deepseek.com`` 仍会规整到 ``/v1``；
     火山引擎的 ``.../api/v3`` 则保持不变，避免生成无效的 ``/api/v3/v1``。
+    Anthropic 原生接口可以直接填到 ``.../v1/messages``，此时不会再追加路径。
     """
     base_url = str(value or "").strip().rstrip("/")
     if not urlsplit(base_url).path:
@@ -2613,8 +2614,20 @@ def _normalize_ai_base_url(value):
     return base_url
 
 
+def _is_anthropic_messages_base_url(base_url):
+    """是否按 Anthropic /v1/messages 原生协议发送。
+
+    配置字段仍叫 base_url，是为了兼容现有前端和配置文件。只有用户明确填到
+    /messages 端点时才启用 Anthropic 协议，避免误伤已有 OpenAI-compatible 中转。
+    """
+
+    parsed = urlsplit(str(base_url or "").strip())
+    path = (parsed.path or "").rstrip("/").lower()
+    return path.endswith("/messages")
+
+
 def _safe_ai_endpoint(base_url):
-    """请求时再校验一次 base_url 只指向公网主机，然后拼出 chat/completions 端点。
+    """请求时再校验一次 base_url 只指向公网主机，然后拼出实际 AI 端点。
 
     这是带凭据 POST 前的最后一道防线：拦截历史遗留的坏配置、经环境变量注入的
     base_url，以及写入校验之后才发生的 DNS 重绑定。校验失败直接拒发请求，
@@ -2625,6 +2638,8 @@ def _safe_ai_endpoint(base_url):
         assert_safe_outbound_url(base_url)
     except UnsafeOutboundURLError as exc:
         raise RuntimeError(f"AI base_url 不安全，已拒绝外发请求: {exc}") from exc
+    if _is_anthropic_messages_base_url(base_url):
+        return str(base_url or "").strip().rstrip("/")
     return f"{base_url}/chat/completions"
 
 
@@ -2656,18 +2671,15 @@ def _ai_call(prompt, system_prompt=None, temperature=0.1, timeout=120):
     if system_prompt:
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
-
-    payload = {"model": model, "messages": messages, "temperature": temperature}
-    endpoint = _safe_ai_endpoint(base_url)
-    r = AI_SESSION.post(
-        endpoint,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+    response = _chat_completion_request(
+        messages,
+        api_key,
+        base_url,
+        model,
+        temperature=temperature,
         timeout=timeout,
-        allow_redirects=False,
     )
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+    return str(response.get("content") or "").strip()
 
 
 _interest_job_submitter = None
@@ -5988,6 +6000,32 @@ def save_admin_settings(data):
                     secret = str(patch.get(key, "")).strip()
                     if not secret or secret == MASKED_SECRET or set(secret) == {"*"}:
                         patch.pop(key, None)
+                    elif key == "api_key" and len(secret) > 4096:
+                        raise ValueError("api_key 过长")
+                    else:
+                        patch[key] = secret
+        if section == "ai":
+            if "base_url" in patch:
+                base_url = str(patch.get("base_url") or "").strip().rstrip("/")
+                if base_url:
+                    parsed = urlsplit(base_url)
+                    if (
+                        parsed.scheme not in {"http", "https"}
+                        or not parsed.netloc
+                        or parsed.username is not None
+                        or parsed.password is not None
+                    ):
+                        raise ValueError("base_url 必须是有效的 http/https URL")
+                    try:
+                        assert_safe_outbound_url(base_url)
+                    except UnsafeOutboundURLError:
+                        raise ValueError("base_url 不能指向内网、回环或元数据地址")
+                patch["base_url"] = base_url
+            if "model" in patch:
+                model = str(patch.get("model") or "").strip()
+                if len(model) > 200:
+                    raise ValueError("model 不能超过 200 个字符")
+                patch["model"] = model
         if section == "pc" and "cloudflare_tunnel_url" in patch:
             server_url = str(patch.get("cloudflare_tunnel_url") or "").strip().rstrip("/")
             if server_url and not server_url.startswith(("http://", "https://")):
@@ -7557,17 +7595,133 @@ def _is_context_length_error(response, detail):
     return any(marker in normalized for marker in _CONTEXT_LENGTH_ERROR_MARKERS)
 
 
-def _chat_completion_request(messages, api_key, base_url, model, tools=None, timeout=120):
-    payload = {"model": model, "messages": messages, "temperature": 0.3}
+def _response_json_or_error(response):
+    try:
+        return response.json()
+    except Exception as exc:
+        status = int(getattr(response, "status_code", 0) or 0)
+        headers = getattr(response, "headers", {}) or {}
+        try:
+            content_type = headers.get("Content-Type") or headers.get("content-type") or ""
+        except AttributeError:
+            content_type = ""
+        snippet = str(getattr(response, "text", "") or "")[:200].strip()
+        detail = f"AI 返回非 JSON 响应(status={status}, content_type={content_type or '-'})"
+        if snippet:
+            detail += f": {snippet}"
+        raise RuntimeError(detail) from exc
+
+
+def _message_content_to_text(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        pieces = []
+        for block in content:
+            if isinstance(block, str):
+                pieces.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") == "text" and block.get("text") is not None:
+                    pieces.append(str(block.get("text") or ""))
+                elif block.get("content") is not None:
+                    pieces.append(str(block.get("content") or ""))
+        return "\n".join(piece for piece in pieces if piece)
+    if content is None:
+        return ""
+    return str(content)
+
+
+def _anthropic_messages_payload(messages, model, temperature=0.3, max_tokens=4096):
+    system_parts = []
+    converted = []
+    for message in messages:
+        role = str((message or {}).get("role") or "user").strip().lower()
+        content = _message_content_to_text((message or {}).get("content")).strip()
+        if not content:
+            continue
+        if role == "system":
+            system_parts.append(content)
+            continue
+        if role == "assistant":
+            target_role = "assistant"
+        else:
+            target_role = "user"
+            if role == "tool":
+                content = f"工具结果：\n{content}"
+        if converted and converted[-1]["role"] == target_role:
+            converted[-1]["content"] = f"{converted[-1]['content']}\n\n{content}"
+        else:
+            converted.append({"role": target_role, "content": content})
+    if not converted:
+        converted.append({"role": "user", "content": "请只回复 OK"})
+    payload = {
+        "model": model,
+        "messages": converted,
+        "max_tokens": int(max_tokens),
+        "temperature": float(temperature),
+    }
+    if system_parts:
+        payload["system"] = "\n\n".join(system_parts)
+    return payload
+
+
+def _anthropic_message_from_response(payload):
+    blocks = payload.get("content") if isinstance(payload, dict) else None
+    text_parts = []
+    if isinstance(blocks, str):
+        text_parts.append(blocks)
+    elif isinstance(blocks, list):
+        for block in blocks:
+            if isinstance(block, str):
+                text_parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("text") is not None:
+                    text_parts.append(str(block.get("text") or ""))
+                elif block.get("content") is not None:
+                    text_parts.append(str(block.get("content") or ""))
+    content = "\n".join(part for part in text_parts if part).strip()
+    if not content:
+        raise ValueError("Anthropic AI 返回了无效消息")
+    return {"role": "assistant", "content": content}
+
+
+def _chat_completion_request(
+    messages,
+    api_key,
+    base_url,
+    model,
+    tools=None,
+    timeout=120,
+    temperature=0.3,
+):
+    endpoint = _safe_ai_endpoint(base_url)
+    is_anthropic = _is_anthropic_messages_base_url(base_url)
+    if is_anthropic:
+        if tools:
+            raise RuntimeError("Anthropic /v1/messages 暂不支持本系统的工具调用，请关闭联网检索")
+        payload = _anthropic_messages_payload(
+            messages,
+            model,
+            temperature=temperature,
+        )
+        headers = {
+            "x-api-key": api_key,
+            "Authorization": f"Bearer {api_key}",
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+    else:
+        payload = {"model": model, "messages": messages, "temperature": temperature}
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
     response = AI_SESSION.post(
-        _safe_ai_endpoint(base_url),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
+        endpoint,
+        headers=headers,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
         timeout=timeout,
         allow_redirects=False,
@@ -7577,7 +7731,10 @@ def _chat_completion_request(messages, api_key, base_url, model, tools=None, tim
         if _is_context_length_error(response, detail):
             raise AIContextLengthError("AI 模型上下文长度不足")
     response.raise_for_status()
-    message = response.json()["choices"][0]["message"]
+    payload = _response_json_or_error(response)
+    if is_anthropic:
+        return _anthropic_message_from_response(payload)
+    message = payload["choices"][0]["message"]
     if not isinstance(message, dict):
         raise ValueError("AI 返回了无效消息")
     return message
