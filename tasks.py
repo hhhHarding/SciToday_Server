@@ -7098,6 +7098,19 @@ def get_digest_content(filename):
             original_url = candidate
             break
 
+    resolved_pdf = resolve_pdf_path(filename)
+    pdf_filename = ""
+    pdf_size = 0
+    if resolved_pdf:
+        try:
+            pdf_file = Path(resolved_pdf)
+            if pdf_file.is_file():
+                pdf_filename = pdf_file.name
+                pdf_size = pdf_file.stat().st_size
+        except OSError:
+            pdf_filename = ""
+            pdf_size = 0
+
     return {
         "filename": filename,
         "title": title or filename,
@@ -7105,7 +7118,9 @@ def get_digest_content(filename):
         "created_at": created_at,
         "content": content,
         "original_url": original_url,
-        "pdf_available": bool(resolve_pdf_path(filename)),
+        "pdf_available": bool(pdf_filename),
+        "pdf_filename": pdf_filename,
+        "pdf_size": pdf_size,
     }
 
 
