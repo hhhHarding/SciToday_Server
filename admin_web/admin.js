@@ -559,6 +559,7 @@ async function renderSettings() {
         <label>每源抓取上限<input id="perFeedLimit" type="number" min="1" value="${h(rss.per_feed_limit || 3)}"></label>
         <label>每轮发布上限<input id="maxPushItems" type="number" min="1" value="${h(rss.max_push_items || 20)}"></label>
         <label>RSS 抓取最近天数<input id="rssLookbackDays" type="number" min="1" max="365" value="${h(rss.lookback_days || 7)}"></label>
+        <label>抓取原文摘要<select id="fetchOriginalAbstract"><option value="true">启用</option><option value="false">停用</option></select></label>
         <label>最近重置时间<input readonly value="${h(rss.last_reset_at || "尚未手动重置")}"></label>
         <label>当前抓取起点<input readonly value="${h(rss.fetch_since_at || "")}"></label>
       </div>
@@ -647,6 +648,7 @@ async function renderSettings() {
     <button id="saveSettingsBtn" class="primary">保存设置</button>`;
   const enabled = String((cfg.schedule || {}).enabled ?? true);
   document.getElementById("scheduleEnabled").value = enabled;
+  document.getElementById("fetchOriginalAbstract").value = String(rss.fetch_original_abstract ?? true);
 }
 
 function formatBytes(bytes) {
@@ -1053,6 +1055,7 @@ document.addEventListener("click", async e => {
         per_feed_limit: Number(document.getElementById("perFeedLimit").value || 3),
         max_push_items: Number(document.getElementById("maxPushItems").value || 20),
         lookback_days: Number(document.getElementById("rssLookbackDays").value || 7),
+        fetch_original_abstract: document.getElementById("fetchOriginalAbstract").value === "true",
         preference_weights: preferenceWeights,
         ...readRssFetchSettings(),
       },

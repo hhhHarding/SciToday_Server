@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from xml.etree import ElementTree as ET
@@ -197,6 +198,13 @@ RSS_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.8,zh;q=0.7",
     "Accept-Encoding": "gzip, deflate",
 }
+ARTICLE_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1",
+    "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.7,zh;q=0.6",
+}
+ARTICLE_FETCH_TIMEOUT = (5, 10)
+ARTICLE_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+ARTICLE_MAX_ABSTRACT_CHARS = 6000
 
 RSS_MIN_INTERVAL_SECONDS = 15 * 60
 RSS_DEFAULT_INTERVAL_SECONDS = 60 * 60
@@ -960,7 +968,15 @@ def _original_host_header(url):
     return f"{host}:{parsed.port}" if parsed.port is not None else host
 
 
-def _request_pinned_feed_url(url, addresses, timeout, headers=None, session=None):
+def _request_pinned_feed_url(
+    url,
+    addresses,
+    timeout,
+    headers=None,
+    session=None,
+    *,
+    stream=False,
+):
     """GET one URL using only the validated addresses; automatic redirects stay off."""
 
     parsed = urlsplit(url)
@@ -975,6 +991,7 @@ def _request_pinned_feed_url(url, addresses, timeout, headers=None, session=None
                 headers={**RSS_HEADERS, **(headers or {}), "Host": host_header},
                 timeout=timeout,
                 allow_redirects=False,
+                stream=stream,
             )
             # 对外保持原始 URL，避免日志/调用方看到内部固定 IP。
             response.url = url
@@ -1049,6 +1066,7 @@ def http_get(
     resolver=None,
     headers=None,
     session=None,
+    stream=False,
 ):
     """安全抓取 RSS：固定已验证 IP，并对每一跳重定向重新做 SSRF 校验。"""
 
@@ -1076,6 +1094,7 @@ def http_get(
                     timeout,
                     headers=headers,
                     session=reusable_session,
+                    stream=stream,
                 )
                 # 304 是条件请求的正常“未更新”响应，204 也表示没有可返回内容；
                 # 只有明确具备重定向语义的状态码才要求 Location。不能用整个
@@ -1149,6 +1168,276 @@ def _clean_full(text):
     text = re.sub(r"<[^>]+>", " ", text)
     text = html_mod.unescape(text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _clean_original_abstract(text):
+    cleaned = _clean_full(text)
+    cleaned = re.sub(
+        r"^(?:abstract|summary|摘要)\s*[:：.\-–—]?\s*",
+        "",
+        cleaned,
+        flags=re.I,
+    ).strip()
+    return cleaned[:ARTICLE_MAX_ABSTRACT_CHARS]
+
+
+def _iter_json_objects(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _iter_json_objects(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_json_objects(child)
+
+
+class _ArticleAbstractHTMLParser(HTMLParser):
+    _VOID_TAGS = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.metadata = {}
+        self.json_ld = []
+        self.abstract_candidates = []
+        self._abstract_depth = 0
+        self._abstract_source = ""
+        self._abstract_parts = []
+        self._json_ld_parts = None
+
+    @staticmethod
+    def _attrs(attrs):
+        return {str(key).lower(): value for key, value in attrs}
+
+    def handle_starttag(self, tag, attrs):
+        tag = str(tag).lower()
+        values = self._attrs(attrs)
+        if tag == "meta":
+            key = str(
+                values.get("name")
+                or values.get("property")
+                or values.get("itemprop")
+                or ""
+            ).strip().lower()
+            value = str(values.get("content") or "").strip()
+            if key and value and key not in self.metadata:
+                self.metadata[key] = value
+        if tag == "script" and "ld+json" in str(values.get("type") or "").lower():
+            self._json_ld_parts = []
+
+        if self._abstract_depth:
+            if tag not in self._VOID_TAGS:
+                self._abstract_depth += 1
+            return
+        marker = " ".join(
+            str(values.get(key) or "") for key in ("id", "class", "role")
+        ).lower()
+        if tag == "abstract" or (
+            tag in {"section", "article", "div"} and "abstract" in marker
+        ):
+            self._abstract_depth = 1
+            self._abstract_source = (
+                "element:abstract" if tag == "abstract" else "element:abstract-container"
+            )
+            self._abstract_parts = []
+
+    def handle_startendtag(self, tag, attrs):
+        normalized = str(tag).lower()
+        previous_depth = self._abstract_depth
+        self.handle_starttag(tag, attrs)
+        if normalized not in self._VOID_TAGS and self._abstract_depth > previous_depth:
+            self.handle_endtag(tag)
+
+    def handle_data(self, data):
+        if self._json_ld_parts is not None:
+            self._json_ld_parts.append(data)
+        if self._abstract_depth:
+            self._abstract_parts.append(data)
+
+    def handle_endtag(self, tag):
+        tag = str(tag).lower()
+        if tag == "script" and self._json_ld_parts is not None:
+            self.json_ld.append("".join(self._json_ld_parts))
+            self._json_ld_parts = None
+        if self._abstract_depth:
+            self._abstract_depth -= 1
+            if self._abstract_depth == 0:
+                self.abstract_candidates.append(
+                    (" ".join(self._abstract_parts), self._abstract_source)
+                )
+                self._abstract_parts = []
+                self._abstract_source = ""
+
+
+def _extract_original_abstract_from_html(content):
+    """Return ``(abstract, source)`` from a publisher article page."""
+
+    if not content:
+        return "", ""
+    if isinstance(content, bytes):
+        content = content.decode("utf-8-sig", errors="replace")
+    parser = _ArticleAbstractHTMLParser()
+    try:
+        parser.feed(str(content))
+        parser.close()
+    except Exception:
+        # HTMLParser may still have collected useful head metadata from malformed HTML.
+        pass
+
+    for key in (
+        "citation_abstract",
+        "citation_description",
+        "dc.description",
+        "dcterms.abstract",
+        "prism.abstract",
+        "eprints.abstract",
+    ):
+        abstract = _clean_original_abstract(parser.metadata.get(key, ""))
+        if len(abstract) >= 40:
+            return abstract, f"meta:{key}"
+
+    for raw in parser.json_ld:
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        nodes = list(_iter_json_objects(payload))
+        for node in nodes:
+            abstract = _clean_original_abstract(node.get("abstract", ""))
+            if len(abstract) >= 40:
+                return abstract, "jsonld:abstract"
+        for node in nodes:
+            raw_types = node.get("@type") or []
+            if isinstance(raw_types, str):
+                raw_types = [raw_types]
+            if not any("article" in str(value).lower() for value in raw_types):
+                continue
+            abstract = _clean_original_abstract(node.get("description", ""))
+            if len(abstract) >= 40:
+                return abstract, "jsonld:description"
+
+    for raw, source in parser.abstract_candidates:
+        abstract = _clean_original_abstract(raw)
+        if len(abstract) >= 40:
+            return abstract, source
+
+    for key in ("og:description", "twitter:description", "description"):
+        abstract = _clean_original_abstract(parser.metadata.get(key, ""))
+        if len(abstract) >= 40:
+            return abstract, f"meta:{key}"
+    return "", ""
+
+
+def fetch_original_abstract(url):
+    """Safely fetch one public article page and extract its original abstract."""
+
+    url = str(url or "").strip()
+    result = {
+        "text": "",
+        "source": "",
+        "status": "no_link" if not url else "fetch_error",
+        "final_url": "",
+        "truncated": False,
+    }
+    if not url:
+        return result
+    response = None
+    try:
+        response = http_get(
+            url,
+            timeout=ARTICLE_FETCH_TIMEOUT,
+            max_attempts=1,
+            max_redirects=5,
+            headers=ARTICLE_HEADERS,
+            stream=True,
+        )
+        result["final_url"] = str(getattr(response, "url", "") or url)
+        status = int(getattr(response, "status_code", 0) or 0)
+        if status != 200:
+            result["status"] = f"http_{status}" if status else "http_error"
+            return result
+
+        content_type = str(response.headers.get("Content-Type") or "").lower()
+        if content_type and not any(
+            allowed in content_type for allowed in ("text/html", "application/xhtml+xml")
+        ):
+            result["status"] = "unsupported_content_type"
+            return result
+
+        chunks = []
+        size = 0
+        for chunk in response.iter_content(chunk_size=64 * 1024):
+            if not chunk:
+                continue
+            remaining = ARTICLE_MAX_RESPONSE_BYTES - size
+            if remaining <= 0:
+                result["truncated"] = True
+                break
+            chunks.append(chunk[:remaining])
+            size += min(len(chunk), remaining)
+            if len(chunk) > remaining or size >= ARTICLE_MAX_RESPONSE_BYTES:
+                result["truncated"] = True
+                break
+        payload = b"".join(chunks)
+        encoding = str(getattr(response, "encoding", "") or "utf-8")
+        try:
+            page = payload.decode(encoding, errors="replace")
+        except LookupError:
+            page = payload.decode("utf-8", errors="replace")
+        abstract, source = _extract_original_abstract_from_html(page)
+        result["text"] = abstract
+        result["source"] = source
+        result["status"] = "ok" if abstract else (
+            "not_found_truncated" if result["truncated"] else "not_found"
+        )
+        return result
+    except UnsafeOutboundURLError:
+        result["status"] = "unsafe_url"
+        return result
+    except requests.Timeout:
+        result["status"] = "timeout"
+        return result
+    except requests.RequestException as exc:
+        result["status"] = "network_error"
+        logger.info(
+            "原文摘要抓取失败: %s | %s",
+            redact_sensitive_text(url),
+            redact_sensitive_text(str(exc)),
+        )
+        return result
+    except Exception as exc:
+        result["status"] = "parse_error"
+        logger.info(
+            "原文摘要解析失败: %s | %s",
+            redact_sensitive_text(url),
+            redact_sensitive_text(str(exc)),
+        )
+        return result
+    finally:
+        if response is not None:
+            response.close()
+
+
+def enrich_rss_item_with_original_abstract(item, config=None):
+    """Enrich a queue item once; failures remain a non-fatal RSS fallback."""
+
+    if item.get("original_abstract_attempted"):
+        return item
+    cfg = config or load_config()
+    enabled = (cfg.get("rss") or {}).get("fetch_original_abstract", True)
+    item["original_abstract_attempted"] = True
+    if enabled is not True:
+        item["original_abstract_status"] = "disabled"
+        return item
+    fetched = fetch_original_abstract(item.get("link", ""))
+    item["original_abstract"] = fetched["text"]
+    item["original_abstract_source"] = fetched["source"]
+    item["original_abstract_status"] = fetched["status"]
+    item["article_final_url"] = fetched["final_url"]
+    item["original_abstract_truncated"] = fetched["truncated"]
+    return item
 
 
 def _normalize_feed_url(url):
@@ -1864,9 +2153,18 @@ def _migrate_shared_content_db(con):
         article_type TEXT,
         link TEXT,
         doi TEXT,
+        original_abstract TEXT NOT NULL DEFAULT '',
         digest_text TEXT NOT NULL,
         source TEXT NOT NULL DEFAULT 'rss',
         digested_ts INTEGER NOT NULL)""")
+    article_columns = {
+        row[1] for row in con.execute("PRAGMA table_info(articles)")
+    }
+    if "original_abstract" not in article_columns:
+        con.execute(
+            "ALTER TABLE articles ADD COLUMN original_abstract "
+            "TEXT NOT NULL DEFAULT ''"
+        )
     con.execute(
         "CREATE INDEX IF NOT EXISTS idx_articles_feed ON articles(source_feed_url)"
     )
@@ -3376,8 +3674,18 @@ def _format_raw(item):
     if item.get("doi"):
         lines.append(f"DOI：{item['doi']}")
     lines.append(f"\n【RSS 信息】\n{item.get('summary', '无')}")
+    if item.get("original_abstract"):
+        lines.append(f"\n【原文摘要】\n{item['original_abstract']}")
     lines.append(f"\n【原文链接】\n{item.get('link', '')}")
     return "\n".join(lines)
+
+
+def _append_original_abstract(digest, item):
+    digest = str(digest or "")
+    original_abstract = str(item.get("original_abstract") or "").strip()
+    if not original_abstract or original_abstract in digest:
+        return digest
+    return f"{digest.rstrip()}\n\n【原文摘要】\n{original_abstract}"
 
 
 def ai_digest_one(item):
@@ -3390,6 +3698,7 @@ def ai_digest_one(item):
     system_prompt = _cfg("ai.system_prompt")
     authors = item.get("authors") or []
     authors_text = ", ".join(authors[:12]) if authors else "未提供"
+    original_abstract = item.get("original_abstract", "") or "未提取到原文摘要"
 
     prompt = f"""{rss_prompt}
 
@@ -3407,11 +3716,19 @@ DOI：{item.get('doi', '') or '未提供'}
 【RSS 信息】
 {item.get('summary', '') or '无'}
 
+【原文页面提取摘要】
+{original_abstract}
+
+请优先依据原文页面提取摘要生成总结；若未提取到，则仅依据 RSS 信息。不要补充输入中没有的事实。
+
 【原文链接】
 {item.get('link', '')}"""
 
     try:
-        return _ai_call(prompt, system_prompt, timeout=120)
+        return _append_original_abstract(
+            _ai_call(prompt, system_prompt, timeout=120),
+            item,
+        )
     except Exception as e:
         logger.error(f"AI 整理失败: {e}")
         return _format_raw(item)
@@ -4120,6 +4437,8 @@ def _publish_rss_item(item, idx=1, total=1, progress_callback=None, config=None)
     if progress_callback:
         progress_callback(idx, total, f"整理 [{idx}/{total}]: {item['title'][:30]}...")
     logger.info(f"整理: {item['title']}")
+    config = config or load_config()
+    enrich_rss_item_with_original_abstract(item, config=config)
     register_pending(item)
     digest = ai_digest_one(item)
 
@@ -4144,7 +4463,13 @@ def _publish_rss_item(item, idx=1, total=1, progress_callback=None, config=None)
         keywords=keywords, journal=journal, recommendation=recommendation,
     )
     if not recommendation.get("disliked"):
-        push.send_digest_notification(cn_title, keywords, filename, config=config)
+        push.send_digest_notification(
+            cn_title,
+            keywords,
+            filename,
+            original_abstract=item.get("original_abstract", ""),
+            config=config,
+        )
     return filename
 
 
@@ -5139,6 +5464,13 @@ def run_shared_rss_ingest(progress_callback=None):
     ).fetchall()
     con.close()
     digested = 0
+    abstract_stats = {
+        "attempted": 0,
+        "extracted": 0,
+        "not_found": 0,
+        "failed": 0,
+        "disabled": 0,
+    }
     total = len(rows)
     for idx, (queue_id, raw) in enumerate(rows, 1):
         try:
@@ -5149,6 +5481,19 @@ def run_shared_rss_ingest(progress_callback=None):
         if progress_callback:
             progress_callback(idx, total, f"消化 [{idx}/{total}]: {item.get('title', '')[:30]}...")
         try:
+            enrich_rss_item_with_original_abstract(item, config=cfg)
+            _update_shared_queue_item(queue_id, item)
+            abstract_status = item.get("original_abstract_status", "")
+            if abstract_status == "disabled":
+                abstract_stats["disabled"] += 1
+            else:
+                abstract_stats["attempted"] += 1
+                if item.get("original_abstract"):
+                    abstract_stats["extracted"] += 1
+                elif abstract_status.startswith("not_found") or abstract_status == "no_link":
+                    abstract_stats["not_found"] += 1
+                else:
+                    abstract_stats["failed"] += 1
             digest = ai_digest_one(item)  # owner 上下文 → owner Key
             journal = _clean_journal_name(item.get("feed") or item.get("source_info") or "")
             filename, ts = save_html(
@@ -5174,6 +5519,7 @@ def run_shared_rss_ingest(progress_callback=None):
     logger.info(msg)
     record_event("shared_ingest", msg, details={
         "discovered": len(discovered), "digested": digested,
+        "original_abstract": abstract_stats,
     })
     # 顺带按 90 天保留清理共享缓存。
     try:
@@ -5183,6 +5529,7 @@ def run_shared_rss_ingest(progress_callback=None):
     return {
         "discovered": len(discovered),
         "digested": digested,
+        "original_abstract": abstract_stats,
         "next_run_at": _next_shared_fetch_ts(feeds),
     }
 
@@ -5197,24 +5544,37 @@ def _mark_shared_queue(queue_id, status, error=""):
     con.close()
 
 
+def _update_shared_queue_item(queue_id, item):
+    con = _shared_content_db()
+    con.execute(
+        "UPDATE shared_queue SET item_json=? WHERE id=?",
+        (_json_dumps(item), queue_id),
+    )
+    con.commit()
+    con.close()
+
+
 def _upsert_shared_article(item, filename, digest_text, cn_title, keywords, journal):
     con = _shared_content_db()
     con.execute("""INSERT INTO articles
         (item_key, filename, title, cn_title, keywords, journal, source_feed_url,
-         source_feed_title, article_type, link, doi, digest_text, source, digested_ts)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'rss', ?)
+         source_feed_title, article_type, link, doi, original_abstract, digest_text,
+         source, digested_ts)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'rss', ?)
         ON CONFLICT(item_key) DO UPDATE SET
             filename=excluded.filename, title=excluded.title, cn_title=excluded.cn_title,
             keywords=excluded.keywords, journal=excluded.journal,
             source_feed_url=excluded.source_feed_url,
             source_feed_title=excluded.source_feed_title,
             article_type=excluded.article_type, link=excluded.link, doi=excluded.doi,
+            original_abstract=excluded.original_abstract,
             digest_text=excluded.digest_text, digested_ts=excluded.digested_ts""",
                 (_rss_item_key(item), filename, item.get("title", ""), cn_title, keywords,
                  journal, _normalize_feed_url(item.get("feed_url", "")),
                  item.get("feed_title", "") or item.get("feed", ""),
-                 item.get("article_type", ""), item.get("link", ""),
-                 item.get("doi", ""), digest_text, int(time.time())))
+                  item.get("article_type", ""), item.get("link", ""),
+                 item.get("doi", ""), item.get("original_abstract", ""),
+                 digest_text, int(time.time())))
     con.commit()
     con.close()
 
@@ -5246,7 +5606,7 @@ def deliver_shared_to_tenant(progress_callback=None):
     rows = con.execute(
         f"""SELECT a.item_key, a.title, a.cn_title, a.keywords, a.journal,
             a.source_feed_url, a.source_feed_title, a.article_type, a.link, a.doi,
-            a.digest_text
+            a.original_abstract, a.digest_text
         FROM articles a
         WHERE a.source_feed_url IN ({placeholders})
           AND a.digested_ts >= ?
@@ -5268,7 +5628,8 @@ def deliver_shared_to_tenant(progress_callback=None):
         items.append({
             "item_key": r[0], "title": r[1], "cn_title": r[2], "keywords": r[3],
             "journal": r[4], "feed_url": r[5], "feed": r[6], "article_type": r[7],
-            "link": r[8], "doi": r[9], "digest_text": r[10],
+            "link": r[8], "doi": r[9], "original_abstract": r[10],
+            "digest_text": r[11],
         })
 
     record_event("rss_deliver", f"投递开始: 候选 {len(items)} 篇")
@@ -5309,7 +5670,13 @@ def deliver_shared_to_tenant(progress_callback=None):
             register_pending(item)
             _mark_delivered(tenant_id, item["item_key"], filename)
             if not recommendation.get("disliked"):
-                push.send_digest_notification(cn_title, keywords, filename, config=cfg)
+                push.send_digest_notification(
+                    cn_title,
+                    keywords,
+                    filename,
+                    original_abstract=item.get("original_abstract", ""),
+                    config=cfg,
+                )
             delivered += 1
             time.sleep(0.5)
         except Exception as e:
@@ -5948,6 +6315,7 @@ def get_admin_settings():
     rss.setdefault("per_feed_limit", 3)
     rss.setdefault("max_push_items", 20)
     rss.setdefault("lookback_days", 7)
+    rss.setdefault("fetch_original_abstract", True)
     rss.setdefault("interest_score_threshold", 70)
     rss["preference_weights"] = _preference_weights(cfg)
     rss.update(validate_rss_fetch_settings(raw_cfg.get("rss") or {}))
@@ -6035,6 +6403,9 @@ def save_admin_settings(data):
             patch["preference_weights"] = validate_preference_weights(
                 patch["preference_weights"]
             )
+        if section == "rss" and "fetch_original_abstract" in patch:
+            if not isinstance(patch["fetch_original_abstract"], bool):
+                raise ValueError("fetch_original_abstract 必须是布尔值")
         if section == "rss" and set(RSS_FETCH_CONFIG_DEFAULTS).intersection(patch):
             normalized_fetch = validate_rss_fetch_settings({
                 **(cfg.get("rss") or {}),

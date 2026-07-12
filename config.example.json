@@ -4,7 +4,7 @@
     "base_url": "https://api.deepseek.com",
     "model": "deepseek-chat",
     "system_prompt": "你是严谨的科研论文阅读助理。必须基于输入信息总结，不能编造。",
-    "rss_prompt": "请基于 RSS 条目信息生成中文论文摘要。只能使用输入中明确给出的信息，缺失信息请写未提供。",
+    "rss_prompt": "请基于 RSS 条目信息和原文页面提取摘要生成中文论文摘要。优先采用原文摘要，只能使用输入中明确给出的信息，缺失信息请写未提供。",
     "pdf_prompt": "请基于 PDF 正文片段生成中文全文摘要。只能使用 PDF 文本中的信息，不能编造。"
   },
   "rss": {
@@ -12,6 +12,7 @@
     "per_feed_limit": 3,
     "max_push_items": 20,
     "lookback_days": 7,
+    "fetch_original_abstract": true,
     "interest_score_threshold": 70,
     "rss_min_interval_minutes": 15,
     "rss_default_interval_minutes": 60,

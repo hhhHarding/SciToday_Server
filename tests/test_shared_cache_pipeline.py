@@ -91,6 +91,9 @@ class SharedCachePipelineTests(unittest.TestCase):
 
     def _run_ingest_with_fake_ai(self):
         keys_used = []
+        original_abstract = (
+            "Original publisher abstract with enough detail for the shared cache test."
+        )
 
         def fake_ai_call(prompt, system_prompt=None, temperature=0.1, timeout=120):
             keys_used.append(tasks._ai_config()[0])
@@ -106,7 +109,14 @@ class SharedCachePipelineTests(unittest.TestCase):
             con.close()
 
         with patch.object(tasks, "_fetch_single_feed", side_effect=_feed_entries), \
-                patch.object(tasks, "_ai_call", side_effect=fake_ai_call):
+                patch.object(tasks, "_ai_call", side_effect=fake_ai_call), \
+                patch.object(tasks, "fetch_original_abstract", return_value={
+                    "text": original_abstract,
+                    "source": "meta:citation_abstract",
+                    "status": "ok",
+                    "final_url": "https://publisher.example/article",
+                    "truncated": False,
+                }):
             with tenant_context("owner"):
                 result = tasks.run_shared_rss_ingest()
         return result, keys_used
@@ -121,9 +131,12 @@ class SharedCachePipelineTests(unittest.TestCase):
         con = tasks._shared_content_db()
         count = con.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
         feeds = {r[0] for r in con.execute("SELECT DISTINCT source_feed_url FROM articles")}
+        abstracts = {r[0] for r in con.execute("SELECT DISTINCT original_abstract FROM articles")}
         con.close()
         self.assertEqual(count, 4)
         self.assertEqual(feeds, {FEED_A, FEED_B})
+        self.assertEqual(len(abstracts), 1)
+        self.assertTrue(next(iter(abstracts)).startswith("Original publisher abstract"))
 
         # 再跑一次不应重复消化（shared_seen 去重）。
         result2, _ = self._run_ingest_with_fake_ai()
@@ -197,6 +210,24 @@ class SharedCachePipelineTests(unittest.TestCase):
         with tenant_context("t_alpha"):
             with self.assertRaises(RuntimeError):
                 tasks.run_shared_rss_ingest()
+
+    def test_existing_shared_article_table_adds_original_abstract_column(self):
+        con = tasks.sqlite3.connect(self.server_paths.shared_content_db)
+        con.execute("""CREATE TABLE articles(
+            item_key TEXT PRIMARY KEY, filename TEXT UNIQUE NOT NULL, title TEXT,
+            cn_title TEXT, keywords TEXT, journal TEXT, source_feed_url TEXT,
+            source_feed_title TEXT, article_type TEXT, link TEXT, doi TEXT,
+            digest_text TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'rss',
+            digested_ts INTEGER NOT NULL)""")
+        con.commit()
+        con.close()
+
+        migrated = tasks._shared_content_db()
+        columns = {
+            row[1] for row in migrated.execute("PRAGMA table_info(articles)")
+        }
+        migrated.close()
+        self.assertIn("original_abstract", columns)
 
     def test_retention_prunes_old_shared_articles(self):
         self._run_ingest_with_fake_ai()

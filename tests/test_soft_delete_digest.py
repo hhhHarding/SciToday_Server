@@ -69,7 +69,11 @@ class SoftDeleteDigestTests(unittest.TestCase):
                 "base_url": "https://example.invalid",
                 "model": "m",
             },
-            "rss": {"lookback_days": 7, "max_push_items": 20},
+            "rss": {
+                "lookback_days": 7,
+                "max_push_items": 20,
+                "fetch_original_abstract": False,
+            },
         }
 
     def _set_feeds(self, tenant_id, urls):

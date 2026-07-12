@@ -605,6 +605,7 @@ _CONFIG_ALLOWED_FIELDS = {
             "per_feed_limit",
             "max_push_items",
             "lookback_days",
+            "fetch_original_abstract",
             "interest_score_threshold",
             "preference_weights",
         }
@@ -777,6 +778,9 @@ def api_save_config():
             if threshold < 0 or threshold > 100:
                 return jsonify({"error": "interest_score_threshold 必须在0到100之间"}), 400
             incoming["interest_score_threshold"] = round(threshold, 2)
+        if section == "rss" and "fetch_original_abstract" in incoming:
+            if not isinstance(incoming["fetch_original_abstract"], bool):
+                return jsonify({"error": "fetch_original_abstract 必须是布尔值"}), 400
         if section == "rss" and "preference_weights" in incoming:
             try:
                 incoming["preference_weights"] = tasks.validate_preference_weights(
