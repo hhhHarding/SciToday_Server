@@ -1574,6 +1574,7 @@ def api_digests():
     interested_only = request.args.get("interested_only") in ("1", "true", "True")
     disliked_only = request.args.get("disliked_only") in ("1", "true", "True")
     exclude_disliked = request.args.get("exclude_disliked") in ("1", "true", "True")
+    favorite_only = request.args.get("favorite_only") in ("1", "true", "True")
     if disliked_only and exclude_disliked:
         return jsonify({"error": "disliked_only 和 exclude_disliked 不能同时启用"}), 400
     return jsonify(tasks.get_recent_digests(
@@ -1584,6 +1585,7 @@ def api_digests():
         interested_only=interested_only,
         disliked_only=disliked_only,
         exclude_disliked=exclude_disliked,
+        favorite_only=favorite_only,
     ))
 
 
@@ -1628,7 +1630,12 @@ def api_ai_search_digests():
 def api_digest_stats():
     source = request.args.get("source") or None
     exclude_disliked = request.args.get("exclude_disliked") in ("1", "true", "True")
-    return jsonify(tasks.get_digest_stats(source=source, exclude_disliked=exclude_disliked))
+    favorite_only = request.args.get("favorite_only") in ("1", "true", "True")
+    return jsonify(tasks.get_digest_stats(
+        source=source,
+        exclude_disliked=exclude_disliked,
+        favorite_only=favorite_only,
+    ))
 
 
 @app.route("/api/digests/journal-stats")
@@ -1662,7 +1669,7 @@ def api_digest_flags(filename):
             return jsonify(tasks.get_digest_flags(filename))
 
         data = request.get_json(silent=True) or {}
-        for key in ("disliked", "interested", "is_read"):
+        for key in ("disliked", "interested", "is_read", "favorite"):
             if key in data and not isinstance(data[key], bool):
                 return jsonify({"error": f"{key} 必须是布尔值"}), 400
         if data.get("disliked") is True and data.get("interested") is True:
@@ -1672,6 +1679,7 @@ def api_digest_flags(filename):
             disliked=data.get("disliked"),
             interested=data.get("interested"),
             is_read=data.get("is_read"),
+            favorite=data.get("favorite"),
         )
         return jsonify({"ok": True, **flags})
     except ValueError as e:

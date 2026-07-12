@@ -6518,7 +6518,7 @@ AI_SEARCH_RESULT_LIMIT = 30
 AI_SEARCH_PREVIEW_CHARS = 300
 AI_SEARCH_RRF_K = 60
 _DIGEST_SELECT_COLUMNS = """filename, timestamp, title, cn_title, keywords,
-    journal, source, preview, disliked, interested, is_read, relevance_score,
+    journal, source, preview, disliked, interested, is_read, read_later, relevance_score,
     novelty_score, final_score, recommendation_type, interest_profile_version,
     scored_at"""
 _DIGEST_SELECT_COLUMNS_QUALIFIED = ", ".join(
@@ -6548,12 +6548,13 @@ def _digest_row_to_dict(row):
         "disliked": bool(row[8]),
         "interested": bool(row[9]),
         "is_read": bool(row[10]),
-        "relevance_score": row[11],
-        "novelty_score": row[12],
-        "final_score": row[13],
-        "recommendation_type": row[14] or "",
-        "interest_profile_version": int(row[15] or 0),
-        "scored_at": int(row[16] or 0),
+        "favorite": bool(row[11]),
+        "relevance_score": row[12],
+        "novelty_score": row[13],
+        "final_score": row[14],
+        "recommendation_type": row[15] or "",
+        "interest_profile_version": int(row[16] or 0),
+        "scored_at": int(row[17] or 0),
     }
 
 
@@ -6874,7 +6875,8 @@ def ai_search_digests(query, candidate_filenames=None, ai_rank=True):
 
 def get_recent_digests(limit=None, source=None, recommendation=None,
                        journal_group_key=None, interested_only=False,
-                       disliked_only=False, exclude_disliked=False):
+                       disliked_only=False, exclude_disliked=False,
+                       favorite_only=False):
     if limit is not None:
         limit = int(limit)
         if limit <= 0:
@@ -6899,6 +6901,8 @@ def get_recent_digests(limit=None, source=None, recommendation=None,
             params.append(journal_group_key)
         if interested_only:
             clauses.append("interested=1")
+        if favorite_only:
+            clauses.append("read_later=1")
         if disliked_only:
             clauses.append("disliked=1")
         elif exclude_disliked:
@@ -6932,10 +6936,13 @@ def get_recent_digests(limit=None, source=None, recommendation=None,
                 continue
             if exclude_disliked and digest.get("disliked"):
                 continue
+            if favorite_only:
+                continue
             digest.pop("created_ts", None)
             digest["disliked"] = bool(digest.get("disliked"))
             digest["interested"] = False
             digest["is_read"] = False
+            digest["favorite"] = False
             digest["deleted"] = False
             digests.append(digest)
             if limit is not None and len(digests) >= limit:
@@ -6943,7 +6950,7 @@ def get_recent_digests(limit=None, source=None, recommendation=None,
         return digests
 
 
-def get_digest_stats(source=None, exclude_disliked=False):
+def get_digest_stats(source=None, exclude_disliked=False, favorite_only=False):
     """某来源全库（未删除）卡片总数与已读数。只读，供状态条显示真实口径。"""
     _sync_digest_index()
     con = _digest_db()
@@ -6953,6 +6960,8 @@ def get_digest_stats(source=None, exclude_disliked=False):
         params.append(source)
     if exclude_disliked:
         clauses.append("disliked=0")
+    if favorite_only:
+        clauses.append("read_later=1")
     where = "WHERE " + " AND ".join(clauses)
     row = con.execute(
         f"SELECT COUNT(*), COALESCE(SUM(is_read),0) FROM digests {where}", params
@@ -7030,7 +7039,7 @@ def get_digest_updates(after=0, limit=50, source=None):
         params.append(source)
     params.append(limit)
     rows = con.execute(f"""SELECT id, filename, timestamp, title, cn_title, keywords,
-        journal, source, preview, disliked, interested, is_read, relevance_score,
+        journal, source, preview, disliked, interested, is_read, read_later, relevance_score,
         novelty_score, final_score, recommendation_type, interest_profile_version,
         scored_at FROM digests
         {where}
@@ -7054,12 +7063,13 @@ def get_digest_updates(after=0, limit=50, source=None):
             "disliked": bool(r[9]),
             "interested": bool(r[10]),
             "is_read": bool(r[11]),
-            "relevance_score": r[12],
-            "novelty_score": r[13],
-            "final_score": r[14],
-            "recommendation_type": r[15] or "",
-            "interest_profile_version": int(r[16] or 0),
-            "scored_at": int(r[17] or 0),
+            "favorite": bool(r[12]),
+            "relevance_score": r[13],
+            "novelty_score": r[14],
+            "final_score": r[15],
+            "recommendation_type": r[16] or "",
+            "interest_profile_version": int(r[17] or 0),
+            "scored_at": int(r[18] or 0),
         })
     return {"cursor": cursor, "items": items}
 
@@ -7070,7 +7080,7 @@ def get_digest_flags(filename):
     _sync_digest_index()
     con = _digest_db()
     row = con.execute(
-        "SELECT disliked, interested, is_read FROM digests WHERE filename=?",
+        "SELECT disliked, interested, is_read, read_later FROM digests WHERE filename=?",
         (filename,),
     ).fetchone()
     con.close()
@@ -7081,18 +7091,21 @@ def get_digest_flags(filename):
         "disliked": bool(row[0]),
         "interested": bool(row[1]),
         "is_read": bool(row[2]),
+        "favorite": bool(row[3]),
     }
 
 
-def update_digest_flags(filename, disliked=None, interested=None, is_read=None):
+def update_digest_flags(filename, disliked=None, interested=None, is_read=None,
+                        favorite=None):
     if not filename or "/" in filename or "\\" in filename or ".." in filename:
         raise ValueError("非法文件名")
     _sync_digest_index()
-    _ensure_interest_feedback_baseline()
+    if disliked is not None or interested is not None or is_read is not None:
+        _ensure_interest_feedback_baseline()
     con = _digest_db()
     digest_row = con.execute(
         """SELECT filename, title, journal, keywords, preview,
-        disliked, interested, is_read
+        disliked, interested, is_read, read_later
         FROM digests WHERE filename=?""",
         (filename,),
     ).fetchone()
@@ -7125,6 +7138,9 @@ def update_digest_flags(filename, disliked=None, interested=None, is_read=None):
     if is_read is not None:
         updates.append("is_read=?")
         params.append(1 if is_read else 0)
+    if favorite is not None:
+        updates.append("read_later=?")
+        params.append(1 if favorite else 0)
     if updates:
         params.append(filename)
         con.execute(
@@ -7134,7 +7150,7 @@ def update_digest_flags(filename, disliked=None, interested=None, is_read=None):
         con.commit()
 
     row = con.execute(
-        "SELECT disliked, interested, is_read FROM digests WHERE filename=?",
+        "SELECT disliked, interested, is_read, read_later FROM digests WHERE filename=?",
         (filename,),
     ).fetchone()
     con.close()
@@ -7166,6 +7182,7 @@ def update_digest_flags(filename, disliked=None, interested=None, is_read=None):
         "disliked": bool(row[0]),
         "interested": bool(row[1]),
         "is_read": bool(row[2]),
+        "favorite": bool(row[3]),
     }
 
 
