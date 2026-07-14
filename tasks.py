@@ -205,6 +205,10 @@ ARTICLE_HEADERS = {
 ARTICLE_FETCH_TIMEOUT = (5, 10)
 ARTICLE_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 ARTICLE_MAX_ABSTRACT_CHARS = 6000
+ANTHROPIC_WEB_FETCH_LATEST = "web_fetch_20260318"
+ANTHROPIC_WEB_FETCH_LEGACY = "web_fetch_20250910"
+ANTHROPIC_WEB_FETCH_MAX_CONTENT_TOKENS = 12000
+ANTHROPIC_WEB_FETCH_MAX_CONTINUATIONS = 2
 
 RSS_MIN_INTERVAL_SECONDS = 15 * 60
 RSS_DEFAULT_INTERVAL_SECONDS = 60 * 60
@@ -2154,17 +2158,19 @@ def _migrate_shared_content_db(con):
         link TEXT,
         doi TEXT,
         original_abstract TEXT NOT NULL DEFAULT '',
+        rss_summary TEXT NOT NULL DEFAULT '',
+        web_fetch_status TEXT NOT NULL DEFAULT '',
         digest_text TEXT NOT NULL,
         source TEXT NOT NULL DEFAULT 'rss',
         digested_ts INTEGER NOT NULL)""")
     article_columns = {
         row[1] for row in con.execute("PRAGMA table_info(articles)")
     }
-    if "original_abstract" not in article_columns:
-        con.execute(
-            "ALTER TABLE articles ADD COLUMN original_abstract "
-            "TEXT NOT NULL DEFAULT ''"
-        )
+    for name in ("original_abstract", "rss_summary", "web_fetch_status"):
+        if name not in article_columns:
+            con.execute(
+                f"ALTER TABLE articles ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+            )
     con.execute(
         "CREATE INDEX IF NOT EXISTS idx_articles_feed ON articles(source_feed_url)"
     )
@@ -2980,6 +2986,175 @@ def _ai_call(prompt, system_prompt=None, temperature=0.1, timeout=120):
     return str(response.get("content") or "").strip()
 
 
+def _anthropic_web_fetch_eligibility(item, config=None):
+    """Return whether this RSS item should use the bounded Anthropic fallback."""
+
+    cfg = config or load_config()
+    rss_cfg = cfg.get("rss") or {}
+    if rss_cfg.get("fetch_original_abstract", True) is not True:
+        return False, "disabled"
+    if rss_cfg.get("anthropic_web_fetch_enabled", True) is not True:
+        return False, "disabled"
+    if str(item.get("original_abstract") or "").strip():
+        return False, "not_needed"
+    _, base_url, model = _ai_config()
+    if (
+        not _is_anthropic_messages_base_url(base_url)
+        or not str(model or "").strip().lower().startswith("claude")
+    ):
+        return False, "not_applicable"
+    if not str(item.get("link") or item.get("article_final_url") or "").strip():
+        return False, "no_link"
+    status = str(item.get("original_abstract_status") or "").strip().lower()
+    if status in {"disabled", "unsafe_url", "no_link"}:
+        return False, status or "not_applicable"
+    if status == "ok":
+        return True, "pending"
+    if (
+        status in {
+            "",
+            "fetch_error",
+            "http_error",
+            "timeout",
+            "network_error",
+            "parse_error",
+            "unsupported_content_type",
+            "not_found",
+            "not_found_truncated",
+        }
+        or status.startswith("http_")
+    ):
+        return True, "pending"
+    return False, "not_applicable"
+
+
+def _anthropic_web_fetch_domains(item):
+    domains = []
+    for raw_url in (item.get("article_final_url"), item.get("link")):
+        url = str(raw_url or "").strip()
+        if not url:
+            continue
+        try:
+            assert_safe_outbound_url(url)
+        except (UnsafeOutboundURLError, ValueError):
+            continue
+        parsed = urlsplit(url)
+        domain = str(parsed.hostname or "").strip().lower().rstrip(".")
+        if parsed.scheme in {"http", "https"} and domain and domain not in domains:
+            domains.append(domain)
+    return domains
+
+
+def _anthropic_web_fetch_tool(version, domains):
+    return {
+        "type": version,
+        "name": "web_fetch",
+        "max_uses": 1,
+        "max_content_tokens": ANTHROPIC_WEB_FETCH_MAX_CONTENT_TOKENS,
+        "allowed_domains": domains,
+    }
+
+
+def _plain_digest_after_web_fetch_failure(prompt, system_prompt, status, timeout):
+    logger.info("Anthropic Web Fetch 回退为普通 digest: %s", status)
+    fallback_prompt = (
+        f"{prompt}\n\n"
+        "Web Fetch 当前不可用。不要再尝试调用工具；请仅依据上面的 RSS 信息生成 digest。"
+    )
+    return _ai_call(fallback_prompt, system_prompt, timeout=timeout), status
+
+
+def _ai_digest_with_anthropic_web_fetch(prompt, system_prompt, item, timeout=180):
+    """Run one native Anthropic digest with Web Fetch, probing tool versions once."""
+
+    api_key, base_url, model = _ai_config()
+    item["web_fetch_attempted"] = False
+    if not api_key:
+        raise RuntimeError("未配置 AI API Key")
+    domains = _anthropic_web_fetch_domains(item)
+    if not domains:
+        return _plain_digest_after_web_fetch_failure(
+            prompt, system_prompt, "no_allowed_domain", timeout
+        )
+
+    capability_key = (str(base_url).rstrip("/"), str(model))
+    with _anthropic_web_fetch_capabilities_lock:
+        capability = _anthropic_web_fetch_capabilities.get(capability_key)
+    if capability == "unsupported":
+        return _plain_digest_after_web_fetch_failure(
+            prompt, system_prompt, "unsupported", timeout
+        )
+    if capability == ANTHROPIC_WEB_FETCH_LATEST:
+        versions = [ANTHROPIC_WEB_FETCH_LATEST, ANTHROPIC_WEB_FETCH_LEGACY]
+    elif capability == ANTHROPIC_WEB_FETCH_LEGACY:
+        versions = [ANTHROPIC_WEB_FETCH_LEGACY]
+    else:
+        versions = [ANTHROPIC_WEB_FETCH_LATEST, ANTHROPIC_WEB_FETCH_LEGACY]
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": prompt})
+    unsupported_count = 0
+    for version in versions:
+        try:
+            item["web_fetch_attempted"] = True
+            message = _chat_completion_request(
+                messages,
+                api_key,
+                base_url,
+                model,
+                anthropic_server_tools=[_anthropic_web_fetch_tool(version, domains)],
+                temperature=0.1,
+                timeout=timeout,
+            )
+        except AnthropicServerToolUnsupported:
+            unsupported_count += 1
+            logger.info(
+                "Anthropic endpoint 不支持 Web Fetch 工具版本 %s: %s",
+                version,
+                redact_sensitive_text(base_url),
+            )
+            continue
+        except AnthropicPauseTurnLimitError:
+            return _plain_digest_after_web_fetch_failure(
+                prompt, system_prompt, "pause_turn_failed", timeout
+            )
+        except Exception as exc:
+            logger.info("Anthropic Web Fetch 请求失败: %s", redact_sensitive_text(str(exc)))
+            return _plain_digest_after_web_fetch_failure(
+                prompt, system_prompt, "request_error", timeout
+            )
+
+        with _anthropic_web_fetch_capabilities_lock:
+            _anthropic_web_fetch_capabilities[capability_key] = version
+        content = str(message.get("content") or "").strip()
+        meta = message.get("_anthropic_server_tool") or {}
+        if meta.get("succeeded"):
+            status = "success"
+        elif meta.get("errors"):
+            status = f"page_error:{meta['errors'][0]}"
+        elif meta.get("attempted"):
+            status = "page_error:unknown"
+        else:
+            status = "not_used"
+        if content:
+            return content, status
+        return _plain_digest_after_web_fetch_failure(
+            prompt, system_prompt, status, timeout
+        )
+
+    if unsupported_count == len(versions):
+        with _anthropic_web_fetch_capabilities_lock:
+            _anthropic_web_fetch_capabilities[capability_key] = "unsupported"
+        return _plain_digest_after_web_fetch_failure(
+            prompt, system_prompt, "unsupported", timeout
+        )
+    return _plain_digest_after_web_fetch_failure(
+        prompt, system_prompt, "request_error", timeout
+    )
+
+
 _interest_job_submitter = None
 _interest_job_submitter_guard = threading.Lock()
 
@@ -3688,6 +3863,43 @@ def _append_original_abstract(digest, item):
     return f"{digest.rstrip()}\n\n【原文摘要】\n{original_abstract}"
 
 
+def _plain_summary_text(value):
+    text = re.sub(r"<[^>]+>", " ", html_mod.unescape(str(value or "")))
+    return " ".join(text.split()).strip()
+
+
+def _digest_preview(digest):
+    lines = []
+    for raw_line in str(digest or "").splitlines():
+        line = _plain_summary_text(raw_line).strip("#*-：: ")
+        if not line:
+            continue
+        normalized = line.lower()
+        if normalized.startswith(("中文题目", "中文标题", "中文关键词", "关键词")):
+            continue
+        if line in {"论文", "RSS 信息", "原文链接", "原文摘要"}:
+            continue
+        lines.append(line)
+    return " ".join(lines)
+
+
+def notification_summary_for_item(item, digest):
+    """Choose the configured summary fallback for an RSS notification."""
+
+    original = _plain_summary_text(item.get("original_abstract"))
+    if original:
+        return original
+    digest_preview = _digest_preview(digest)
+    if str(item.get("web_fetch_status") or "") == "success" and digest_preview:
+        return digest_preview
+    rss_summary = _plain_summary_text(
+        item.get("rss_summary") if "rss_summary" in item else item.get("summary")
+    )
+    if rss_summary:
+        return rss_summary
+    return digest_preview
+
+
 def ai_digest_one(item):
     api_key = _env_or_cfg("AI_API_KEY", "ai.api_key")
     if not api_key:
@@ -3696,9 +3908,22 @@ def ai_digest_one(item):
 
     rss_prompt = _cfg("ai.rss_prompt")
     system_prompt = _cfg("ai.system_prompt")
+    cfg = load_config()
     authors = item.get("authors") or []
     authors_text = ", ".join(authors[:12]) if authors else "未提供"
     original_abstract = item.get("original_abstract", "") or "未提取到原文摘要"
+    use_web_fetch, web_fetch_reason = _anthropic_web_fetch_eligibility(item, cfg)
+    web_fetch_url = str(item.get("article_final_url") or item.get("link") or "").strip()
+    web_fetch_instruction = ""
+    if use_web_fetch:
+        web_fetch_instruction = f"""
+
+【Web Fetch 回退要求】
+Python 未能提取原文摘要。请对下面这个明确 URL 调用一次 web_fetch：
+{web_fetch_url}
+优先使用原文页面中的论文摘要生成 digest；若工具返回页面错误、robots 限制或无法访问，则仅依据 RSS 信息生成 digest。不要编造。"""
+    else:
+        item.setdefault("web_fetch_status", web_fetch_reason)
 
     prompt = f"""{rss_prompt}
 
@@ -3720,16 +3945,28 @@ DOI：{item.get('doi', '') or '未提供'}
 {original_abstract}
 
 请优先依据原文页面提取摘要生成总结；若未提取到，则仅依据 RSS 信息。不要补充输入中没有的事实。
+{web_fetch_instruction}
 
 【原文链接】
 {item.get('link', '')}"""
 
     try:
+        if use_web_fetch:
+            digest, web_fetch_status = _ai_digest_with_anthropic_web_fetch(
+                prompt,
+                system_prompt,
+                item,
+                timeout=180,
+            )
+            item["web_fetch_status"] = web_fetch_status
+            return digest
         return _append_original_abstract(
             _ai_call(prompt, system_prompt, timeout=120),
             item,
         )
     except Exception as e:
+        if use_web_fetch:
+            item["web_fetch_status"] = "request_error"
         logger.error(f"AI 整理失败: {e}")
         return _format_raw(item)
 
@@ -4467,7 +4704,7 @@ def _publish_rss_item(item, idx=1, total=1, progress_callback=None, config=None)
             cn_title,
             keywords,
             filename,
-            original_abstract=item.get("original_abstract", ""),
+            summary=notification_summary_for_item(item, digest),
             config=config,
         )
     return filename
@@ -5471,6 +5708,12 @@ def run_shared_rss_ingest(progress_callback=None):
         "failed": 0,
         "disabled": 0,
     }
+    web_fetch_stats = {
+        "attempted": 0,
+        "succeeded": 0,
+        "page_failed": 0,
+        "unsupported": 0,
+    }
     total = len(rows)
     for idx, (queue_id, raw) in enumerate(rows, 1):
         try:
@@ -5495,6 +5738,16 @@ def run_shared_rss_ingest(progress_callback=None):
                 else:
                     abstract_stats["failed"] += 1
             digest = ai_digest_one(item)  # owner 上下文 → owner Key
+            _update_shared_queue_item(queue_id, item)
+            web_fetch_status = str(item.get("web_fetch_status") or "")
+            if item.get("web_fetch_attempted"):
+                web_fetch_stats["attempted"] += 1
+            if web_fetch_status == "success":
+                web_fetch_stats["succeeded"] += 1
+            elif web_fetch_status == "unsupported":
+                web_fetch_stats["unsupported"] += 1
+            elif web_fetch_status.startswith("page_error:"):
+                web_fetch_stats["page_failed"] += 1
             journal = _clean_journal_name(item.get("feed") or item.get("source_info") or "")
             filename, ts = save_html(
                 item["title"], digest, source="rss", journal=journal,
@@ -5520,6 +5773,7 @@ def run_shared_rss_ingest(progress_callback=None):
     record_event("shared_ingest", msg, details={
         "discovered": len(discovered), "digested": digested,
         "original_abstract": abstract_stats,
+        "web_fetch": web_fetch_stats,
     })
     # 顺带按 90 天保留清理共享缓存。
     try:
@@ -5530,6 +5784,7 @@ def run_shared_rss_ingest(progress_callback=None):
         "discovered": len(discovered),
         "digested": digested,
         "original_abstract": abstract_stats,
+        "web_fetch": web_fetch_stats,
         "next_run_at": _next_shared_fetch_ts(feeds),
     }
 
@@ -5558,9 +5813,9 @@ def _upsert_shared_article(item, filename, digest_text, cn_title, keywords, jour
     con = _shared_content_db()
     con.execute("""INSERT INTO articles
         (item_key, filename, title, cn_title, keywords, journal, source_feed_url,
-         source_feed_title, article_type, link, doi, original_abstract, digest_text,
-         source, digested_ts)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'rss', ?)
+         source_feed_title, article_type, link, doi, original_abstract, rss_summary,
+         web_fetch_status, digest_text, source, digested_ts)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'rss', ?)
         ON CONFLICT(item_key) DO UPDATE SET
             filename=excluded.filename, title=excluded.title, cn_title=excluded.cn_title,
             keywords=excluded.keywords, journal=excluded.journal,
@@ -5568,12 +5823,15 @@ def _upsert_shared_article(item, filename, digest_text, cn_title, keywords, jour
             source_feed_title=excluded.source_feed_title,
             article_type=excluded.article_type, link=excluded.link, doi=excluded.doi,
             original_abstract=excluded.original_abstract,
+            rss_summary=excluded.rss_summary,
+            web_fetch_status=excluded.web_fetch_status,
             digest_text=excluded.digest_text, digested_ts=excluded.digested_ts""",
                 (_rss_item_key(item), filename, item.get("title", ""), cn_title, keywords,
                  journal, _normalize_feed_url(item.get("feed_url", "")),
                  item.get("feed_title", "") or item.get("feed", ""),
                   item.get("article_type", ""), item.get("link", ""),
                  item.get("doi", ""), item.get("original_abstract", ""),
+                 item.get("summary", ""), item.get("web_fetch_status", ""),
                  digest_text, int(time.time())))
     con.commit()
     con.close()
@@ -5606,7 +5864,7 @@ def deliver_shared_to_tenant(progress_callback=None):
     rows = con.execute(
         f"""SELECT a.item_key, a.title, a.cn_title, a.keywords, a.journal,
             a.source_feed_url, a.source_feed_title, a.article_type, a.link, a.doi,
-            a.original_abstract, a.digest_text
+            a.original_abstract, a.rss_summary, a.web_fetch_status, a.digest_text
         FROM articles a
         WHERE a.source_feed_url IN ({placeholders})
           AND a.digested_ts >= ?
@@ -5629,7 +5887,7 @@ def deliver_shared_to_tenant(progress_callback=None):
             "item_key": r[0], "title": r[1], "cn_title": r[2], "keywords": r[3],
             "journal": r[4], "feed_url": r[5], "feed": r[6], "article_type": r[7],
             "link": r[8], "doi": r[9], "original_abstract": r[10],
-            "digest_text": r[11],
+            "rss_summary": r[11], "web_fetch_status": r[12], "digest_text": r[13],
         })
 
     record_event("rss_deliver", f"投递开始: 候选 {len(items)} 篇")
@@ -5674,7 +5932,7 @@ def deliver_shared_to_tenant(progress_callback=None):
                     cn_title,
                     keywords,
                     filename,
-                    original_abstract=item.get("original_abstract", ""),
+                    summary=notification_summary_for_item(item, digest),
                     config=cfg,
                 )
             delivered += 1
@@ -6316,6 +6574,7 @@ def get_admin_settings():
     rss.setdefault("max_push_items", 20)
     rss.setdefault("lookback_days", 7)
     rss.setdefault("fetch_original_abstract", True)
+    rss.setdefault("anthropic_web_fetch_enabled", True)
     rss.setdefault("interest_score_threshold", 70)
     rss["preference_weights"] = _preference_weights(cfg)
     rss.update(validate_rss_fetch_settings(raw_cfg.get("rss") or {}))
@@ -6406,6 +6665,9 @@ def save_admin_settings(data):
         if section == "rss" and "fetch_original_abstract" in patch:
             if not isinstance(patch["fetch_original_abstract"], bool):
                 raise ValueError("fetch_original_abstract 必须是布尔值")
+        if section == "rss" and "anthropic_web_fetch_enabled" in patch:
+            if not isinstance(patch["anthropic_web_fetch_enabled"], bool):
+                raise ValueError("anthropic_web_fetch_enabled 必须是布尔值")
         if section == "rss" and set(RSS_FETCH_CONFIG_DEFAULTS).intersection(patch):
             normalized_fetch = validate_rss_fetch_settings({
                 **(cfg.get("rss") or {}),
@@ -7964,6 +8226,23 @@ class AIContextLengthError(RuntimeError):
     """AI provider 拒绝了超过上下文窗口的请求。"""
 
 
+class AnthropicServerToolUnsupported(RuntimeError):
+    """Anthropic-compatible endpoint does not support the requested server tool."""
+
+
+class AnthropicPauseTurnLimitError(RuntimeError):
+    """Anthropic server tool remained paused after the bounded continuations."""
+
+
+_anthropic_web_fetch_capabilities = {}
+_anthropic_web_fetch_capabilities_lock = threading.Lock()
+
+
+def _reset_anthropic_web_fetch_capabilities_for_tests():
+    with _anthropic_web_fetch_capabilities_lock:
+        _anthropic_web_fetch_capabilities.clear()
+
+
 _CONTEXT_LENGTH_ERROR_MARKERS = (
     "context_length_exceeded",
     "maximum context length",
@@ -8071,6 +8350,12 @@ def _anthropic_messages_payload(messages, model, temperature=0.3, max_tokens=409
 def _anthropic_message_from_response(payload):
     blocks = payload.get("content") if isinstance(payload, dict) else None
     text_parts = []
+    tool_meta = {
+        "attempted": False,
+        "succeeded": False,
+        "errors": [],
+        "uses": 0,
+    }
     if isinstance(blocks, str):
         text_parts.append(blocks)
     elif isinstance(blocks, list):
@@ -8078,14 +8363,66 @@ def _anthropic_message_from_response(payload):
             if isinstance(block, str):
                 text_parts.append(block)
             elif isinstance(block, dict):
-                if block.get("text") is not None:
+                block_type = str(block.get("type") or "")
+                if block_type == "text" and block.get("text") is not None:
                     text_parts.append(str(block.get("text") or ""))
-                elif block.get("content") is not None:
-                    text_parts.append(str(block.get("content") or ""))
+                elif block_type == "server_tool_use" and block.get("name") == "web_fetch":
+                    tool_meta["attempted"] = True
+                    tool_meta["uses"] += 1
+                elif block_type == "web_fetch_tool_result":
+                    tool_meta["attempted"] = True
+                    result_content = block.get("content")
+                    result_blocks = result_content if isinstance(result_content, list) else [result_content]
+                    for result in result_blocks:
+                        if not isinstance(result, dict):
+                            continue
+                        result_type = str(result.get("type") or "")
+                        if result_type == "web_fetch_result":
+                            tool_meta["succeeded"] = True
+                        elif result_type == "web_fetch_tool_result_error" or result.get("error_code"):
+                            error_code = str(
+                                result.get("error_code")
+                                or result.get("code")
+                                or "web_fetch_error"
+                            )
+                            if error_code not in tool_meta["errors"]:
+                                tool_meta["errors"].append(error_code)
     content = "\n".join(part for part in text_parts if part).strip()
-    if not content:
+    if not content and not tool_meta["attempted"]:
         raise ValueError("Anthropic AI 返回了无效消息")
-    return {"role": "assistant", "content": content}
+    message = {"role": "assistant", "content": content}
+    if tool_meta["attempted"]:
+        message["_anthropic_server_tool"] = tool_meta
+    return message
+
+
+def _anthropic_server_tool_unsupported(response, detail):
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status not in {400, 404, 422}:
+        return False
+    normalized = str(detail or "").lower()
+    if "web_fetch" not in normalized and "web fetch" not in normalized:
+        return False
+    return any(marker in normalized for marker in (
+        "unsupported",
+        "not supported",
+        "unknown tool",
+        "unrecognized",
+        "invalid tool",
+        "invalid_request_error",
+    ))
+
+
+def _merge_anthropic_tool_meta(target, message):
+    current = message.get("_anthropic_server_tool") if isinstance(message, dict) else None
+    if not isinstance(current, dict):
+        return
+    target["attempted"] = target["attempted"] or bool(current.get("attempted"))
+    target["succeeded"] = target["succeeded"] or bool(current.get("succeeded"))
+    target["uses"] += int(current.get("uses") or 0)
+    for error in current.get("errors") or []:
+        if error not in target["errors"]:
+            target["errors"].append(error)
 
 
 def _chat_completion_request(
@@ -8096,6 +8433,7 @@ def _chat_completion_request(
     tools=None,
     timeout=120,
     temperature=0.3,
+    anthropic_server_tools=None,
 ):
     endpoint = _safe_ai_endpoint(base_url)
     is_anthropic = _is_anthropic_messages_base_url(base_url)
@@ -8107,6 +8445,8 @@ def _chat_completion_request(
             model,
             temperature=temperature,
         )
+        if anthropic_server_tools:
+            payload["tools"] = anthropic_server_tools
         headers = {
             "x-api-key": api_key,
             "Authorization": f"Bearer {api_key}",
@@ -8114,6 +8454,8 @@ def _chat_completion_request(
             "Content-Type": "application/json",
         }
     else:
+        if anthropic_server_tools:
+            raise RuntimeError("Anthropic Web Fetch 仅支持原生 /v1/messages 协议")
         payload = {"model": model, "messages": messages, "temperature": temperature}
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -8122,22 +8464,48 @@ def _chat_completion_request(
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
-    response = AI_SESSION.post(
-        endpoint,
-        headers=headers,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        timeout=timeout,
-        allow_redirects=False,
-    )
-    if int(getattr(response, "status_code", 0) or 0) >= 400:
-        detail = _response_error_text(response)
-        if _is_context_length_error(response, detail):
-            raise AIContextLengthError("AI 模型上下文长度不足")
-    response.raise_for_status()
-    payload = _response_json_or_error(response)
-    if is_anthropic:
-        return _anthropic_message_from_response(payload)
-    message = payload["choices"][0]["message"]
+    continuation_count = 0
+    aggregate_tool_meta = {
+        "attempted": False,
+        "succeeded": False,
+        "errors": [],
+        "uses": 0,
+    }
+    while True:
+        response = AI_SESSION.post(
+            endpoint,
+            headers=headers,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            timeout=timeout,
+            allow_redirects=False,
+        )
+        if int(getattr(response, "status_code", 0) or 0) >= 400:
+            detail = _response_error_text(response)
+            if _is_context_length_error(response, detail):
+                raise AIContextLengthError("AI 模型上下文长度不足")
+            if anthropic_server_tools and _anthropic_server_tool_unsupported(response, detail):
+                raise AnthropicServerToolUnsupported(detail)
+        response.raise_for_status()
+        response_payload = _response_json_or_error(response)
+        if not is_anthropic:
+            break
+        message = _anthropic_message_from_response(response_payload)
+        _merge_anthropic_tool_meta(aggregate_tool_meta, message)
+        if response_payload.get("stop_reason") != "pause_turn":
+            if aggregate_tool_meta["attempted"]:
+                aggregate_tool_meta["continuations"] = continuation_count
+                message["_anthropic_server_tool"] = aggregate_tool_meta
+            return message
+        if continuation_count >= ANTHROPIC_WEB_FETCH_MAX_CONTINUATIONS:
+            raise AnthropicPauseTurnLimitError(
+                "Anthropic Web Fetch 在两次续传后仍未完成"
+            )
+        raw_blocks = response_payload.get("content")
+        if not isinstance(raw_blocks, list) or not raw_blocks:
+            raise ValueError("Anthropic pause_turn 缺少可续传的内容块")
+        payload["messages"].append({"role": "assistant", "content": raw_blocks})
+        continuation_count += 1
+    message = response_payload["choices"][0]["message"]
     if not isinstance(message, dict):
         raise ValueError("AI 返回了无效消息")
     return message

@@ -118,13 +118,16 @@ class ArticleAbstractFetchTests(unittest.TestCase):
         }
         with patch.object(tasks, "_env_or_cfg", return_value="key"), patch.object(
             tasks, "_cfg", return_value="prompt"
-        ), patch.object(tasks, "_ai_call", return_value="digest") as ai:
+        ), patch.object(tasks, "_ai_call", return_value="digest") as ai, patch.object(
+            tasks, "_ai_digest_with_anthropic_web_fetch"
+        ) as web_fetch:
             digest = tasks.ai_digest_one(item)
         self.assertTrue(digest.startswith("digest"))
         self.assertIn("【原文摘要】", digest)
         self.assertIn(ABSTRACT, digest)
         self.assertIn("【原文页面提取摘要】", ai.call_args.args[0])
         self.assertIn(ABSTRACT, ai.call_args.args[0])
+        web_fetch.assert_not_called()
 
         with patch.object(push, "send_notification", return_value=True) as send:
             self.assertTrue(
@@ -135,8 +138,92 @@ class ArticleAbstractFetchTests(unittest.TestCase):
                     original_abstract=ABSTRACT * 3,
                 )
             )
-        self.assertIn("原文摘要:", send.call_args.args[1])
+        message = send.call_args.args[1]
+        self.assertIn("摘要:", message)
         self.assertIn("…", send.call_args.args[1])
+        self.assertLess(message.index("摘要:"), message.index("关键词:"))
+
+    def test_notification_summary_fallback_priority(self):
+        digest = "中文题目：测试\n中文关键词：甲、乙\n这是 digest 正文预览。"
+        item = {
+            "original_abstract": "Python abstract",
+            "web_fetch_status": "success",
+            "summary": "RSS summary",
+        }
+        self.assertEqual(tasks.notification_summary_for_item(item, digest), "Python abstract")
+
+        item["original_abstract"] = ""
+        self.assertEqual(
+            tasks.notification_summary_for_item(item, digest),
+            "这是 digest 正文预览。",
+        )
+
+        item["web_fetch_status"] = "page_error:url_not_accessible"
+        self.assertEqual(tasks.notification_summary_for_item(item, digest), "RSS summary")
+
+        item["summary"] = ""
+        self.assertEqual(
+            tasks.notification_summary_for_item(item, digest),
+            "这是 digest 正文预览。",
+        )
+
+    def test_fetch_original_abstract_switch_disables_both_fetchers(self):
+        item = {
+            "link": "https://publisher.example/paper",
+            "original_abstract_status": "timeout",
+        }
+        eligible, status = tasks._anthropic_web_fetch_eligibility(
+            item,
+            config={
+                "rss": {
+                    "fetch_original_abstract": False,
+                    "anthropic_web_fetch_enabled": True,
+                }
+            },
+        )
+        self.assertFalse(eligible)
+        self.assertEqual(status, "disabled")
+
+    def test_python_failure_routes_existing_digest_to_anthropic_web_fetch(self):
+        item = {
+            "title": "Paper",
+            "summary": "RSS summary",
+            "link": "https://publisher.example/paper",
+            "original_abstract": "",
+            "original_abstract_status": "http_403",
+        }
+        cfg = {
+            "rss": {
+                "fetch_original_abstract": True,
+                "anthropic_web_fetch_enabled": True,
+            }
+        }
+        with (
+            patch.object(tasks, "_env_or_cfg", return_value="key"),
+            patch.object(tasks, "_cfg", return_value="prompt"),
+            patch.object(tasks, "load_config", return_value=cfg),
+            patch.object(
+                tasks,
+                "_ai_config",
+                return_value=(
+                    "key",
+                    "https://api.anthropic.com/v1/messages",
+                    "claude-opus-4-8",
+                ),
+            ),
+            patch.object(
+                tasks,
+                "_ai_digest_with_anthropic_web_fetch",
+                return_value=("web digest", "success"),
+            ) as web_fetch,
+            patch.object(tasks, "_ai_call") as plain_ai,
+        ):
+            digest = tasks.ai_digest_one(item)
+
+        self.assertEqual(digest, "web digest")
+        self.assertEqual(item["web_fetch_status"], "success")
+        self.assertIn("https://publisher.example/paper", web_fetch.call_args.args[0])
+        plain_ai.assert_not_called()
 
 
 if __name__ == "__main__":

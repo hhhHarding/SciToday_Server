@@ -60,14 +60,17 @@ def send_digest_notification(
     filename,
     config=None,
     original_abstract="",
+    summary="",
 ):
-    msg = f"中文题目: {cn_title}\n关键词: {keywords}"
-    abstract = " ".join(str(original_abstract or "").split())
-    if abstract:
-        excerpt = abstract[:180].rstrip()
-        if len(abstract) > 180:
+    # original_abstract is retained for callers from older server versions.
+    summary_text = " ".join(str(summary or original_abstract or "").split())
+    msg = f"中文题目: {cn_title}"
+    if summary_text:
+        excerpt = summary_text[:180].rstrip()
+        if len(summary_text) > 180:
             excerpt += "…"
-        msg += f"\n原文摘要: {excerpt}"
+        msg += f"\n摘要: {excerpt}"
+    msg += f"\n关键词: {keywords}"
     # 通过 App 的 deep link 打开，由 App 用本机 Flask（/inbox）加载摘要。
     # 此前用 file:// 直接指向本地 html，会被浏览器/系统拦截，点击后显示 NOT FOUND。
     # 文件名含中文等字符，必须 URL 编码后才能放进 URI。

@@ -132,11 +132,17 @@ class SharedCachePipelineTests(unittest.TestCase):
         count = con.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
         feeds = {r[0] for r in con.execute("SELECT DISTINCT source_feed_url FROM articles")}
         abstracts = {r[0] for r in con.execute("SELECT DISTINCT original_abstract FROM articles")}
+        rss_summaries = {r[0] for r in con.execute("SELECT DISTINCT rss_summary FROM articles")}
+        web_fetch_statuses = {r[0] for r in con.execute(
+            "SELECT DISTINCT web_fetch_status FROM articles"
+        )}
         con.close()
         self.assertEqual(count, 4)
         self.assertEqual(feeds, {FEED_A, FEED_B})
         self.assertEqual(len(abstracts), 1)
         self.assertTrue(next(iter(abstracts)).startswith("Original publisher abstract"))
+        self.assertTrue(all(summary.startswith("summary of ") for summary in rss_summaries))
+        self.assertEqual(web_fetch_statuses, {"not_needed"})
 
         # 再跑一次不应重复消化（shared_seen 去重）。
         result2, _ = self._run_ingest_with_fake_ai()
@@ -211,7 +217,7 @@ class SharedCachePipelineTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 tasks.run_shared_rss_ingest()
 
-    def test_existing_shared_article_table_adds_original_abstract_column(self):
+    def test_existing_shared_article_table_adds_abstract_fallback_columns(self):
         con = tasks.sqlite3.connect(self.server_paths.shared_content_db)
         con.execute("""CREATE TABLE articles(
             item_key TEXT PRIMARY KEY, filename TEXT UNIQUE NOT NULL, title TEXT,
@@ -228,6 +234,8 @@ class SharedCachePipelineTests(unittest.TestCase):
         }
         migrated.close()
         self.assertIn("original_abstract", columns)
+        self.assertIn("rss_summary", columns)
+        self.assertIn("web_fetch_status", columns)
 
     def test_retention_prunes_old_shared_articles(self):
         self._run_ingest_with_fake_ai()
