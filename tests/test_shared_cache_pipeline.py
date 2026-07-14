@@ -133,16 +133,12 @@ class SharedCachePipelineTests(unittest.TestCase):
         feeds = {r[0] for r in con.execute("SELECT DISTINCT source_feed_url FROM articles")}
         abstracts = {r[0] for r in con.execute("SELECT DISTINCT original_abstract FROM articles")}
         rss_summaries = {r[0] for r in con.execute("SELECT DISTINCT rss_summary FROM articles")}
-        web_fetch_statuses = {r[0] for r in con.execute(
-            "SELECT DISTINCT web_fetch_status FROM articles"
-        )}
         con.close()
         self.assertEqual(count, 4)
         self.assertEqual(feeds, {FEED_A, FEED_B})
         self.assertEqual(len(abstracts), 1)
         self.assertTrue(next(iter(abstracts)).startswith("Original publisher abstract"))
         self.assertTrue(all(summary.startswith("summary of ") for summary in rss_summaries))
-        self.assertEqual(web_fetch_statuses, {"not_needed"})
 
         # 再跑一次不应重复消化（shared_seen 去重）。
         result2, _ = self._run_ingest_with_fake_ai()
@@ -235,7 +231,7 @@ class SharedCachePipelineTests(unittest.TestCase):
         migrated.close()
         self.assertIn("original_abstract", columns)
         self.assertIn("rss_summary", columns)
-        self.assertIn("web_fetch_status", columns)
+        self.assertIn("glm_reader_status", columns)
 
     def test_retention_prunes_old_shared_articles(self):
         self._run_ingest_with_fake_ai()

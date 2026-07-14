@@ -13,7 +13,7 @@
     "max_push_items": 20,
     "lookback_days": 7,
     "fetch_original_abstract": true,
-    "anthropic_web_fetch_enabled": true,
+    "glm_reader_enabled": true,
     "interest_score_threshold": 70,
     "rss_min_interval_minutes": 15,
     "rss_default_interval_minutes": 60,

@@ -606,7 +606,7 @@ _CONFIG_ALLOWED_FIELDS = {
             "max_push_items",
             "lookback_days",
             "fetch_original_abstract",
-            "anthropic_web_fetch_enabled",
+            "glm_reader_enabled",
             "interest_score_threshold",
             "preference_weights",
         }
@@ -782,9 +782,9 @@ def api_save_config():
         if section == "rss" and "fetch_original_abstract" in incoming:
             if not isinstance(incoming["fetch_original_abstract"], bool):
                 return jsonify({"error": "fetch_original_abstract 必须是布尔值"}), 400
-        if section == "rss" and "anthropic_web_fetch_enabled" in incoming:
-            if not isinstance(incoming["anthropic_web_fetch_enabled"], bool):
-                return jsonify({"error": "anthropic_web_fetch_enabled 必须是布尔值"}), 400
+        if section == "rss" and "glm_reader_enabled" in incoming:
+            if not isinstance(incoming["glm_reader_enabled"], bool):
+                return jsonify({"error": "glm_reader_enabled 必须是布尔值"}), 400
         if section == "rss" and "preference_weights" in incoming:
             try:
                 incoming["preference_weights"] = tasks.validate_preference_weights(

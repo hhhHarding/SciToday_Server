@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 
@@ -26,6 +27,24 @@ class _Response:
     def iter_content(self, chunk_size=65536):
         for offset in range(0, len(self._html), chunk_size):
             yield self._html[offset:offset + chunk_size]
+
+    def close(self):
+        self.closed = True
+
+
+class _JsonResponse:
+    def __init__(self, payload, status=200):
+        self.status_code = status
+        self._payload = payload
+        self.closed = False
+
+    def json(self):
+        return self._payload
+
+    def iter_content(self, chunk_size=65536):
+        raw = json.dumps(self._payload).encode("utf-8")
+        for offset in range(0, len(raw), chunk_size):
+            yield raw[offset:offset + chunk_size]
 
     def close(self):
         self.closed = True
@@ -119,15 +138,15 @@ class ArticleAbstractFetchTests(unittest.TestCase):
         with patch.object(tasks, "_env_or_cfg", return_value="key"), patch.object(
             tasks, "_cfg", return_value="prompt"
         ), patch.object(tasks, "_ai_call", return_value="digest") as ai, patch.object(
-            tasks, "_ai_digest_with_anthropic_web_fetch"
-        ) as web_fetch:
+            tasks, "_ai_digest_with_glm_reader"
+        ) as glm_reader:
             digest = tasks.ai_digest_one(item)
         self.assertTrue(digest.startswith("digest"))
         self.assertIn("【原文摘要】", digest)
         self.assertIn(ABSTRACT, digest)
         self.assertIn("【原文页面提取摘要】", ai.call_args.args[0])
         self.assertIn(ABSTRACT, ai.call_args.args[0])
-        web_fetch.assert_not_called()
+        glm_reader.assert_not_called()
 
         with patch.object(push, "send_notification", return_value=True) as send:
             self.assertTrue(
@@ -147,7 +166,6 @@ class ArticleAbstractFetchTests(unittest.TestCase):
         digest = "中文题目：测试\n中文关键词：甲、乙\n这是 digest 正文预览。"
         item = {
             "original_abstract": "Python abstract",
-            "web_fetch_status": "success",
             "summary": "RSS summary",
         }
         self.assertEqual(tasks.notification_summary_for_item(item, digest), "Python abstract")
@@ -155,10 +173,16 @@ class ArticleAbstractFetchTests(unittest.TestCase):
         item["original_abstract"] = ""
         self.assertEqual(
             tasks.notification_summary_for_item(item, digest),
+            "RSS summary",
+        )
+
+        item["glm_reader_status"] = "success"
+        self.assertEqual(
+            tasks.notification_summary_for_item(item, digest),
             "这是 digest 正文预览。",
         )
 
-        item["web_fetch_status"] = "page_error:url_not_accessible"
+        item["glm_reader_status"] = "page_error:empty_content"
         self.assertEqual(tasks.notification_summary_for_item(item, digest), "RSS summary")
 
         item["summary"] = ""
@@ -167,24 +191,86 @@ class ArticleAbstractFetchTests(unittest.TestCase):
             "这是 digest 正文预览。",
         )
 
-    def test_fetch_original_abstract_switch_disables_both_fetchers(self):
+    def test_fetch_original_abstract_switch_disables_glm_reader(self):
         item = {
             "link": "https://publisher.example/paper",
             "original_abstract_status": "timeout",
         }
-        eligible, status = tasks._anthropic_web_fetch_eligibility(
+        eligible, status = tasks._glm_reader_eligibility(
             item,
             config={
                 "rss": {
                     "fetch_original_abstract": False,
-                    "anthropic_web_fetch_enabled": True,
+                    "glm_reader_enabled": True,
                 }
             },
         )
         self.assertFalse(eligible)
         self.assertEqual(status, "disabled")
 
-    def test_python_failure_routes_existing_digest_to_anthropic_web_fetch(self):
+    def test_glm_reader_endpoint_only_accepts_official_general_api(self):
+        self.assertEqual(
+            tasks._glm_reader_endpoint("https://open.bigmodel.cn/api/paas/v4"),
+            "https://open.bigmodel.cn/api/paas/v4/reader",
+        )
+        self.assertEqual(
+            tasks._glm_reader_endpoint("https://open.bigmodel.cn/api/paas/v4/"),
+            "https://open.bigmodel.cn/api/paas/v4/reader",
+        )
+        self.assertEqual(tasks._glm_reader_endpoint("https://proxy.example/v4"), "")
+        self.assertEqual(
+            tasks._glm_reader_endpoint("https://open.bigmodel.cn/api/coding/paas/v4"),
+            "",
+        )
+
+    def test_glm_reader_uses_bounded_official_payload(self):
+        response = _JsonResponse({
+            "reader_result": {
+                "title": "Paper",
+                "description": "Publisher description",
+                "content": "# Abstract\n" + ABSTRACT,
+            }
+        })
+        with patch.object(tasks, "assert_safe_outbound_url"), patch.object(
+            tasks.AI_SESSION, "post", return_value=response
+        ) as post:
+            result = tasks.fetch_with_glm_reader(
+                "https://publisher.example/paper",
+                "secret-key",
+                "https://open.bigmodel.cn/api/paas/v4",
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertIn(ABSTRACT, result["content"])
+        self.assertEqual(
+            post.call_args.args[0],
+            "https://open.bigmodel.cn/api/paas/v4/reader",
+        )
+        payload = json.loads(post.call_args.kwargs["data"])
+        self.assertEqual(payload["url"], "https://publisher.example/paper")
+        self.assertEqual(payload["timeout"], 20)
+        self.assertFalse(payload["retain_images"])
+        self.assertFalse(payload["with_images_summary"])
+        self.assertNotIn("secret-key", str(payload))
+        self.assertTrue(post.call_args.kwargs["stream"])
+        self.assertTrue(response.closed)
+
+    def test_glm_reader_api_error_falls_back_without_page_content(self):
+        response = _JsonResponse({
+            "error": {"code": "reader.blocked", "message": "page blocked"}
+        })
+        with patch.object(tasks, "assert_safe_outbound_url"), patch.object(
+            tasks.AI_SESSION, "post", return_value=response
+        ):
+            result = tasks.fetch_with_glm_reader(
+                "https://publisher.example/paper",
+                "secret-key",
+                "https://open.bigmodel.cn/api/paas/v4",
+            )
+        self.assertEqual(result["status"], "api_error:reader.blocked")
+        self.assertEqual(result["content"], "")
+
+    def test_python_failure_routes_digest_through_glm_reader(self):
         item = {
             "title": "Paper",
             "summary": "RSS summary",
@@ -195,7 +281,7 @@ class ArticleAbstractFetchTests(unittest.TestCase):
         cfg = {
             "rss": {
                 "fetch_original_abstract": True,
-                "anthropic_web_fetch_enabled": True,
+                "glm_reader_enabled": True,
             }
         }
         with (
@@ -207,23 +293,56 @@ class ArticleAbstractFetchTests(unittest.TestCase):
                 "_ai_config",
                 return_value=(
                     "key",
-                    "https://api.anthropic.com/v1/messages",
-                    "claude-opus-4-8",
+                    "https://open.bigmodel.cn/api/paas/v4",
+                    "glm-5.1",
                 ),
             ),
             patch.object(
                 tasks,
-                "_ai_digest_with_anthropic_web_fetch",
-                return_value=("web digest", "success"),
-            ) as web_fetch,
+                "_ai_digest_with_glm_reader",
+                return_value=("reader digest", "success"),
+            ) as reader,
             patch.object(tasks, "_ai_call") as plain_ai,
         ):
             digest = tasks.ai_digest_one(item)
 
-        self.assertEqual(digest, "web digest")
-        self.assertEqual(item["web_fetch_status"], "success")
-        self.assertIn("https://publisher.example/paper", web_fetch.call_args.args[0])
+        self.assertEqual(digest, "reader digest")
+        self.assertEqual(item["glm_reader_status"], "success")
+        reader.assert_called_once()
         plain_ai.assert_not_called()
+
+    def test_glm_reader_page_failure_uses_rss_digest(self):
+        item = {
+            "summary": "RSS summary",
+            "link": "https://publisher.example/paper",
+        }
+        with patch.object(
+            tasks,
+            "_ai_config",
+            return_value=(
+                "key",
+                "https://open.bigmodel.cn/api/paas/v4",
+                "glm-5.1",
+            ),
+        ), patch.object(
+            tasks,
+            "fetch_with_glm_reader",
+            return_value={"status": "empty_content", "content": ""},
+        ), patch.object(
+            tasks,
+            "_ai_call",
+            return_value="RSS digest",
+        ) as ai:
+            digest, status = tasks._ai_digest_with_glm_reader(
+                "RSS prompt with RSS summary",
+                "system",
+                item,
+            )
+
+        self.assertEqual(digest, "RSS digest")
+        self.assertEqual(status, "page_error:empty_content")
+        self.assertTrue(item["glm_reader_attempted"])
+        self.assertIn("仅依据上面的 RSS 信息", ai.call_args.args[0])
 
 
 if __name__ == "__main__":
